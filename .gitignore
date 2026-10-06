@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.nicegui/
+dist/
+build/
+*.egg-info/
+
+# Workspace files (when serving from this folder)
+workspace.json
+saved-queries.json
+workspace.json.bak
+evaluations/

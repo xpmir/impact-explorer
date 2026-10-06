@@ -1,0 +1,55 @@
+[project]
+name = "impact-explorer"
+version = "0.1.0"
+description = "Web interface to explore impact-index search results against datamaestro IR collections"
+readme = "README.md"
+authors = [
+    { name = "Benjamin Piwowarski", email = "benjamin@piwowarski.fr" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "cbor2>=6.1.5",
+    "datamaestro>=1.15",
+    "datamaestro-ir>=0.4.2",
+    "impact-index>=1.7.1",
+    "nicegui>=3.17.1",
+    "snowballstemmer>=3.1.1",
+]
+
+[project.scripts]
+impact-explorer = "impact_explorer.cli:main"
+
+[project.optional-dependencies]
+rewriters = [
+    "accelerate>=1.15.0",
+    "torch>=2.14.1",
+    "transformers>=5.18.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.10",
+]
+
+# Own workspace root: keeps uv from attaching this project to the parent
+# impact-index repository.
+[tool.uv.workspace]
+members = []
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+main_file = ""
