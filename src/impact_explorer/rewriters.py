@@ -15,7 +15,7 @@ Two backends:
 import logging
 import re
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,13 @@ class Rewrite:
     keywords: list[str]
     combine: str = "{query} {keywords}"
     query_weight: int = 1
+    timings: dict = field(default_factory=dict)
+    """``loading`` (first use of the model) and ``generation``
+    (:class:`~impact_explorer.engine.Timing`; CPU time of the whole
+    process, as inference uses several threads)"""
+
+    cached: bool = False
+    """Taken from the cache (the timings are the original ones)"""
 
 
 def clean_output(text: str) -> str:
@@ -278,9 +285,10 @@ def make_rewrite(
 def recombine(rewrite: Rewrite, combine: str, query_weight: int) -> Rewrite:
     """The same outputs, combined differently (no generation)"""
     config = RewriterConfig(name=rewrite.rewriter)
-    return make_rewrite(
+    result = make_rewrite(
         config, rewrite.original, rewrite.outputs, combine, query_weight
     )
+    return replace(result, timings=rewrite.timings, cached=rewrite.cached)
 
 
 def messages(config: RewriterConfig, query: str) -> list[dict]:
@@ -439,7 +447,9 @@ class Rewriters:
             return OpenAIBackend(config)
         return TransformersBackend(config)
 
-    def backend(self, config: RewriterConfig):
+    def backend(self, config: RewriterConfig, timings: dict | None = None):
+        from .engine import Timer
+
         with self._lock:
             if self._configs.get(config.name) != config:
                 self._backends.pop(config.name, None)
@@ -447,20 +457,28 @@ class Rewriters:
                     k: v for k, v in self._cache.items() if k[0] != config.name
                 }
             if config.name not in self._backends:
-                self._backends[config.name] = self.factory(config)
+                with Timer(process=True) as loading:
+                    self._backends[config.name] = self.factory(config)
+                if timings is not None:
+                    timings["loading"] = loading
                 self._configs[config.name] = config
             return self._backends[config.name]
 
     def rewrite(self, config: RewriterConfig, query: str) -> Rewrite:
         """Rewrites a query (cached; meant to run in a thread)"""
+        from .engine import Timer
+
         key = (config.name, query)
-        backend = self.backend(config)
+        timings = {}
+        backend = self.backend(config, timings)
         if key in self._cache:
-            return self._cache[key]
+            return replace(self._cache[key], cached=True)
         # Models are not thread-safe: one generation at a time
         with self._generation_lock:
-            outputs = backend.generate(query)
+            with Timer(process=True) as timings["generation"]:
+                outputs = backend.generate(query)
         result = make_rewrite(config, query, outputs)
+        result.timings = timings
         self._cache[key] = result
         return result
 

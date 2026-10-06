@@ -91,6 +91,11 @@ class Services:
         workspace.on_rewriter_change(self.rewriters.invalidate)
 
 
+def ms(seconds: float) -> str:
+    milliseconds = seconds * 1000
+    return f"{milliseconds:.1f} ms" if milliseconds < 100 else f"{milliseconds:,.0f} ms"
+
+
 class ExplorerPage:
     """Per-client page state and widgets"""
 
@@ -342,6 +347,7 @@ class ExplorerPage:
                 "rewrite-combine",
                 on_change=self.recombine,
             )
+            self.render_rewrite_timings(result)
             with ui.row().classes("gap-1"):
                 for keyword in result.keywords:
                     ui.chip(keyword).props("dense outline square").classes("text-xs")
@@ -352,6 +358,20 @@ class ExplorerPage:
             ):
                 for output in result.outputs:
                     ui.label(output).classes("font-mono whitespace-pre-wrap")
+
+    def render_rewrite_timings(self, result: Rewrite):
+        generation = result.timings.get("generation")
+        if generation is None:
+            return
+        text = f"⏱ inference {ms(generation.wall)} (CPU {ms(generation.cpu)})"
+        if loading := result.timings.get("loading"):
+            text += f" · model loading {ms(loading.wall)}"
+        if result.cached:
+            text += " · cached (time of the first rewrite)"
+        ui.label(text).classes("text-xs text-grey-8").tooltip(
+            "Wall-clock and CPU time of the whole process (inference uses "
+            "several threads; on a GPU, CPU time is mostly waiting)"
+        ).mark("rewrite-time")
 
     async def recombine(self):
         """Searches the same outputs combined differently (no generation)"""
@@ -1151,6 +1171,25 @@ class ExplorerPage:
             self.documents.update(zip(missing, fetched, strict=True))
         self.render()
 
+    def render_timings(self, result: SearchResult):
+        retrieval = result.timings.get("retrieval")
+        if retrieval is None:
+            return
+        analysis = result.timings.get("analysis")
+        text = f"⏱ {ms(retrieval.wall)} (CPU {ms(retrieval.cpu)})"
+        tooltip = (
+            f"Retrieval (impact-index): {ms(retrieval.wall)} wall-clock, "
+            f"{ms(retrieval.cpu)} CPU"
+        )
+        if analysis is not None:
+            tooltip += (
+                f" · query analysis (explorer, incl. df and stems): "
+                f"{ms(analysis.wall)} wall-clock, {ms(analysis.cpu)} CPU"
+            )
+        ui.label(text).classes("text-sm text-grey-8").tooltip(tooltip).mark(
+            "query-time"
+        )
+
     async def original_results(self, engine, text, depth, params):
         """Results of the original topic query, if the query was edited"""
         topic = self.current_topic()
@@ -1257,6 +1296,7 @@ class ExplorerPage:
             ui.label(f"{len(self.result.hits):,} hits (depth {self.depth})").classes(
                 "text-sm"
             )
+            self.render_timings(self.result)
             if self.qrels:
                 for name, value in self.evaluation.metrics.items():
                     with ui.badge(f"{name} {value:.3f}").props("outline color=primary"):

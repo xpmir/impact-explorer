@@ -3,6 +3,7 @@
 import json
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,10 +66,41 @@ class Hit:
 
 
 @dataclass
+@dataclass
+class Timing:
+    """Wall-clock and CPU time of a step, in seconds"""
+
+    wall: float = 0.0
+    cpu: float = 0.0
+
+
+class Timer:
+    """Measures wall-clock and CPU time: by default, of the current thread
+    (searches run in one thread); ``process=True`` counts all threads (e.g.
+    torch inference)"""
+
+    def __init__(self, process: bool = False):
+        self.cpu_clock = time.process_time if process else time.thread_time
+
+    def __enter__(self):
+        self.timing = Timing()
+        self._wall, self._cpu = time.perf_counter(), self.cpu_clock()
+        return self.timing
+
+    def __exit__(self, *_):
+        self.timing.wall = time.perf_counter() - self._wall
+        self.timing.cpu = self.cpu_clock() - self._cpu
+
+
+@dataclass
 class SearchResult:
     query: AnalyzedQuery
     hits: list[Hit]
     """All hits up to the search depth"""
+
+    timings: dict[str, Timing] = field(default_factory=dict)
+    """``analysis`` (query parsing and term lookups) and ``retrieval``
+    (impact-index's search)"""
 
     ranks: dict[str, int] = field(init=False)
 
@@ -333,23 +365,27 @@ class SearchEngine:
         structured: bool | None = None,
         keep_stop_words: bool = False,
     ) -> SearchResult:
-        query = self.analyze(text, structured, keep_stop_words)
+        timings = {}
+        with Timer() as timings["analysis"]:
+            query = self.analyze(text, structured, keep_stop_words)
         if not query.terms:
-            return SearchResult(query=query, hits=[])
+            return SearchResult(query=query, hits=[], timings=timings)
         scored = self.scored(params or self.config.bm25)
         if query.parsed is not None:
             # With the index's stop list, impact-index parses the string
             # itself (the reference); otherwise, the tree resolved here
             tree = to_query_tree(query.parsed) if keep_stop_words else text
             if tree is None:
-                return SearchResult(query=query, hits=[])
+                return SearchResult(query=query, hits=[], timings=timings)
             try:
-                results = scored.search_maxscore_query(tree, depth)
+                with Timer() as timings["retrieval"]:
+                    results = scored.search_maxscore_query(tree, depth)
             except ValueError as e:
                 # impact-index's parser is the reference: report its errors
                 raise QuerySyntaxError(str(e), 0, len(text)) from e
         else:
-            results = scored.search_maxscore(query.vector, depth)
+            with Timer() as timings["retrieval"]:
+                results = scored.search_maxscore(query.vector, depth)
         ext_ids = self.documents.external_ids([r.docid for r in results])
         hits = [
             Hit(rank=rank, docid=ext_id, score=r.score)
@@ -357,7 +393,7 @@ class SearchEngine:
                 zip(ext_ids, results, strict=True), start=1
             )
         ]
-        return SearchResult(query=query, hits=hits)
+        return SearchResult(query=query, hits=hits, timings=timings)
 
 
 class Engines:

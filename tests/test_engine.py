@@ -124,3 +124,10 @@ def test_unverified_stem(collection):
         word, ()
     )
     assert engine.stem(7, ["university"]) == ("univers", False)
+
+
+def test_timings(collection):
+    result = SearchEngine.open(collection).search("quick fox")
+    assert set(result.timings) == {"analysis", "retrieval"}
+    assert result.timings["retrieval"].wall > 0
+    assert result.timings["retrieval"].cpu >= 0

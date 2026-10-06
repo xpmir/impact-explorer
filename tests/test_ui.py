@@ -333,8 +333,10 @@ async def test_rewrite_query(user: User, workspace):
     user.find(marker="topics").trigger("rowClick", [{}, {"id": "q1"}, 0])
     await user.should_see(marker="doc-d0")
 
+    await user.should_see(marker="query-time")
     user.find(marker="rewrite-fake/rewriter").click()
     await user.should_see(marker="rewrite-panel")
+    await user.should_see(marker="rewrite-time")
     query = user.find(marker="query").elements.pop()
     assert query.value == "quick fox fox Vixen den burrow"
     # Compared with the topic's original query

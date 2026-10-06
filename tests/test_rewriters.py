@@ -97,7 +97,11 @@ def test_cache_and_reload():
     config = RewriterConfig(name="fake")
     FakeBackend.calls = 0
     first = rewriters.rewrite(config, "fox")
-    assert rewriters.rewrite(config, "fox") is first
+    assert set(first.timings) == {"loading", "generation"}
+    assert not first.cached
+    again = rewriters.rewrite(config, "fox")
+    assert again.cached and again.query == first.query
+    assert again.timings == first.timings
     assert FakeBackend.calls == 1
     # A modified configuration reloads the model and drops its results
     changed = RewriterConfig(name="fake", combine="{keywords}")
