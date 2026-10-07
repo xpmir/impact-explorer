@@ -130,6 +130,14 @@ give a name, a datamaestro documents dataset, the text pipeline and the
 topic datasets; when the build completes, the collection is added to the
 workspace under that name.
 
+The documents and topic datasets are drop-downs (type to filter) listing
+the installed datamaestro repositories, read from the dataset definitions
+without downloading anything: collections are the datasets whose type is
+a `datamaestro_ir` `Documents`, and their topics the `Adhoc` datasets that
+reference them (selecting documents fills those in). An `Adhoc` dataset
+that bundles its own documents (most BEIR datasets) is listed as a
+collection of its own. Any other dataset id can still be typed.
+
 A build runs in its own process (`impact-explorer build <workspace>
 <name>`): it goes on if the interface stops, and the interface shows its
 progress again when restarted. It has three stages, and resuming a failed,

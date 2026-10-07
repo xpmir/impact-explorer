@@ -754,18 +754,29 @@ class SettingsDialog:
             "workspace. The build runs in its own process: it goes on if the "
             "interface stops, and can be resumed after a failure."
         ).classes("text-xs text-grey-7")
+        documents = (
+            ui.select(
+                {},
+                label="datamaestro documents",
+                with_input=True,
+                new_value_mode="add-unique",
+                clearable=True,
+            )
+            .props("dense input-debounce=0")
+            .classes("w-full font-mono")
+            .mark("build-documents")
+            .tooltip(
+                "Document collections of the installed datamaestro repositories "
+                "(type to filter); any dataset id can be typed"
+            )
+        )
+        catalog_status = ui.label("Loading the datamaestro catalog…").classes(
+            "text-xs text-grey-6 -mt-2"
+        )
         name = (
             ui.input("Name (also the collection's)", placeholder="e.g. msmarco-passage")
             .classes("w-full")
             .mark("build-name")
-        )
-        documents = (
-            ui.input(
-                "datamaestro documents",
-                placeholder="e.g. com.microsoft.msmarco.passage.documents",
-            )
-            .classes("w-full font-mono")
-            .mark("build-documents")
         )
         output = (
             ui.input("Output folder", placeholder="default: indexes/<name>")
@@ -788,15 +799,59 @@ class SettingsDialog:
                 "Stores token positions (needed for #1 and #uwN queries)"
             )
         datasets = (
-            ui.input_chips(
-                "datamaestro IR datasets (topics + assessments)",
-                value=[],
+            ui.select(
+                [],
+                label="datamaestro IR datasets (topics + assessments)",
+                multiple=True,
+                with_input=True,
                 new_value_mode="add-unique",
+                value=[],
             )
-            .props("dense outlined")
+            .props("dense use-chips input-debounce=0")
             .classes("w-full")
             .mark("build-datasets")
+            .tooltip("Those of the selected documents come first")
         )
+        catalog = None
+        # What was filled automatically (user edits are never overwritten)
+        auto = {"name": "", "datasets": []}
+
+        def on_documents(e):
+            documents_id = (e.value or "").strip()
+            if catalog is not None:
+                datasets.set_options(
+                    catalog.topic_options(documents_id), value=datasets.value
+                )
+                if list(datasets.value or []) == auto["datasets"]:
+                    auto["datasets"] = catalog.topics_for(documents_id)
+                    datasets.value = list(auto["datasets"])
+            if (name.value or "") == auto["name"]:
+                auto["name"] = suggested_name(documents_id)
+                name.value = auto["name"]
+
+        documents.on_value_change(on_documents)
+
+        async def load():
+            nonlocal catalog
+            catalog = await run.io_bound(self.services.catalog)
+            if catalog.error:
+                catalog_status.text = f"{catalog.error}: type a dataset id"
+                return
+            documents.set_options(
+                {c.id: c.label for c in catalog.collections.values()},
+                value=documents.value,
+            )
+            datasets.set_options(
+                catalog.topic_options(documents.value), value=datasets.value
+            )
+            with_topics = sum(1 for c in catalog.collections.values() if c.topics)
+            catalog_status.text = (
+                f"{len(catalog.collections)} document collections "
+                f"({with_topics} with topics) in the installed datamaestro "
+                "repositories"
+            )
+
+        ui.timer(0, load, once=True)
         status = ui.label().classes("text-sm").mark("build-status")
 
         def start():
@@ -819,6 +874,17 @@ class SettingsDialog:
 
         with ui.row().classes("w-full justify-end mt-2"):
             ui.button("Start", icon="play_arrow", on_click=start).mark("build-start")
+
+
+DOCUMENTS_SUFFIXES = (".documents", ".collection", ".docs", ".corpus")
+
+
+def suggested_name(documents_id: str) -> str:
+    """A collection name for a documents dataset, e.g. msmarco-passage for
+    com.microsoft.msmarco.passage.documents"""
+    for suffix in DOCUMENTS_SUFFIXES:
+        documents_id = documents_id.removesuffix(suffix)
+    return "-".join(documents_id.split(".")[-2:])
 
 
 def duration(seconds: float) -> str:

@@ -199,3 +199,31 @@ def test_stop_words_options():
     assert spec.builder_options()["stop_words"] == []
     spec.stop_words = "terrier"
     assert spec.builder_options()["stop_words"] == "terrier"
+
+
+def test_suggested_name():
+    from impact_explorer.settings_ui import suggested_name
+
+    assert suggested_name("com.microsoft.msmarco.passage.documents") == (
+        "msmarco-passage"
+    )
+    assert suggested_name("org.beir.scifact.collection") == "beir-scifact"
+    assert suggested_name("org.beir.nq") == "beir-nq"
+
+
+def test_catalog():
+    """Reads the installed datamaestro repositories (nothing is downloaded)"""
+    from impact_explorer.catalog import load_catalog
+
+    catalog = load_catalog()
+    assert catalog.error is None
+    if "org.beir.scifact.collection" not in catalog.collections:
+        pytest.skip("datamaestro-ir BEIR datasets not installed")
+    assert "org.beir.scifact.test" in catalog.topics_for("org.beir.scifact.collection")
+    # Adhoc datasets bundling their documents are collections of their own
+    assert catalog.topics_for("org.beir.nq") == ["org.beir.nq"]
+    options = catalog.topic_options("org.beir.scifact.collection")
+    assert options[: len(catalog.topics_for("org.beir.scifact.collection"))] == (
+        catalog.topics_for("org.beir.scifact.collection")
+    )
+    assert sorted(options) == catalog.topics

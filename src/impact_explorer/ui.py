@@ -8,6 +8,7 @@ from nicegui import run, ui
 
 from .batch import BatchRun, BatchRuns, RunKey, SavedResult, fingerprint
 from .builds import Builds
+from .catalog import catalog as datamaestro_catalog
 from .config import BM25Params, ConfigError, Workspace
 from .documents import Document
 from .engine import Engines, SearchEngine, SearchResult
@@ -81,6 +82,7 @@ class Services:
         topic_sets=None,
         store=None,
         rewriters=None,
+        catalog=None,
     ):
         self.workspace = workspace
         self.engines = engines or Engines(workspace)
@@ -91,6 +93,8 @@ class Services:
         self.rewriters = rewriters or Rewriters()
         workspace.on_rewriter_change(self.rewriters.invalidate)
         self.builds = Builds(workspace)
+        self.catalog = catalog or datamaestro_catalog
+        """Returns the :class:`~impact_explorer.catalog.Catalog` (blocking)"""
 
 
 def ms(seconds: float) -> str:

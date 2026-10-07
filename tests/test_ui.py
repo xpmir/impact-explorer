@@ -444,6 +444,24 @@ async def test_index_info(user: User, workspace):
     assert values["Codecs"] == "none (raw postings)"
 
 
+def fake_catalog():
+    from impact_explorer.catalog import Catalog, CatalogCollection
+
+    return Catalog(
+        collections={
+            "fake.documents": CatalogCollection("fake.documents", topics=["fake.test"]),
+            "other.documents": CatalogCollection("other.documents"),
+        },
+        topics=["fake.test", "other.topics"],
+    )
+
+
+def choose(user: User, marker: str, value):
+    element = user.find(marker=marker).elements.pop()
+    with user:
+        element.set_value(value)
+
+
 async def test_index_build(user: User, workspace, monkeypatch):
     from impact_explorer import builds
     from impact_explorer.builds import Runner
@@ -465,12 +483,19 @@ async def test_index_build(user: User, workspace, monkeypatch):
 
     monkeypatch.setattr(builds.Builds, "start", start)
     services = services_for(workspace)
+    services.catalog = fake_catalog
     create_app(services)
     await user.open("/")
     user.find(marker="settings").click()
     user.find(marker="settings-new-build").click()
+    await user.should_see("2 document collections (1 with topics)")
     user.find(marker="build-name").type("built")
-    user.find(marker="build-documents").type("fake.documents")
+    choose(user, "build-documents", "fake.documents")
+    # Its topics are filled in, the edited name is kept
+    datasets = user.find(marker="build-datasets").elements.pop()
+    assert datasets.value == ["fake.test"]
+    assert datasets.options == ["fake.test", "other.topics"]
+    assert user.find(marker="build-name").elements.pop().value == "built"
     user.find(marker="build-start").click()
     await user.should_see(marker="build-error")
     await user.should_see("OSError: network down")
@@ -485,9 +510,13 @@ async def test_index_build(user: User, workspace, monkeypatch):
     collection = workspace.collection("built")
     assert collection.index == "indexes/built/index"
 
-    # The name is taken
+    assert collection.datasets == ["fake.test"]
+
+    # The name is taken (suggested from the documents id)
     user.find(marker="settings-new-build").click()
-    user.find(marker="build-name").type("built")
-    user.find(marker="build-documents").type("fake.documents")
+    await user.should_see("2 document collections")
+    choose(user, "build-documents", "other.documents")
+    assert user.find(marker="build-name").elements.pop().value == "other"
+    user.find(marker="build-name").clear().type("built")
     user.find(marker="build-start").click()
     await user.should_see("already exists", marker="build-status")
