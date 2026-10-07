@@ -53,6 +53,8 @@ Everything lives in a **workspace folder**:
     workspace.json        collections: index path, documents, datamaestro datasets
     saved-queries.json    saved queries
     evaluations/          stored "Evaluate all" results
+    builds/               index builds (state, lock and log of each)
+    indexes/              default output of index builds
 ```
 
 The settings dialog checks everything as it is edited: index, documents
@@ -96,8 +98,6 @@ weigh more; the *original query weight* repeats `{query}`. The rewrite
 panel can change both without generating again. Naming a rewriter after a
 known model (e.g. `Arthur-75/storm-qwen3-8B`) fills in its preset.
 
-- `transformers` backend: the model runs locally (cuda, mps or cpu); it is
-  downloaded and loaded the first time it is used.
 Empty fields defer to the model: with an empty system prompt and `{query}`
 as user template, the model's chat template builds the prompt, and the
 generation parameters missing from the JSON come from its
@@ -105,6 +105,8 @@ generation parameters missing from the JSON come from its
 this: its repositories hold the prompt (system prompt, `[QUERY]: …`
 wrapping) and the decoding (beam search, 3 outputs).
 
+- `transformers` backend: the model runs locally (cuda, mps or cpu); it is
+  downloaded and loaded the first time it is used.
 - `openai` backend: any OpenAI-compatible server, e.g.
   `vllm serve Arthur-75/storm-qwen3-8B`, with its URL
   (`http://host:8000/v1`).
@@ -120,6 +122,29 @@ the chat API.
 
 A saved query can be opened directly with `/?saved=<id>`, and a collection
 with `/?collection=<name>`.
+
+### Index builds
+
+An index can also be built from the interface (settings, "Index builds"):
+give a name, a datamaestro documents dataset, the text pipeline and the
+topic datasets; when the build completes, the collection is added to the
+workspace under that name.
+
+A build runs in its own process (`impact-explorer build <workspace>
+<name>`): it goes on if the interface stops, and the interface shows its
+progress again when restarted. It has three stages, and resuming a failed,
+cancelled or interrupted build skips the completed ones:
+
+1. *Download documents* (datamaestro);
+2. *Document store*: checkpointed every 50,000 documents, so an
+   interrupted copy resumes from its last checkpoint;
+3. *BOW index*, built from the local document store: an interrupted index
+   restarts from the beginning of this stage (impact-index does not
+   checkpoint the vocabulary of BOW indexes), but nothing is downloaded or
+   copied again.
+
+"Restart from scratch" deletes the document store and index and starts
+over; "Remove" forgets the build but keeps its files.
 
 ### Collections
 

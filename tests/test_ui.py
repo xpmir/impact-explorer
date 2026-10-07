@@ -442,3 +442,52 @@ async def test_index_info(user: User, workspace):
     values = {row["name"]: row["value"] for row in rows}
     assert values["Pipeline"] == "pyserini"
     assert values["Codecs"] == "none (raw postings)"
+
+
+async def test_index_build(user: User, workspace, monkeypatch):
+    from impact_explorer import builds
+    from impact_explorer.builds import Runner
+
+    from .test_builds import FakeDocuments
+
+    documents = FakeDocuments(fail_after=3)
+    monkeypatch.setattr(Runner, "dataset", lambda runner: documents)
+    monkeypatch.setattr(builds, "CHECKPOINT_FREQUENCY", 2)
+    # The runner's logs go to the build log (another process), not here
+    monkeypatch.setattr(builds.logger, "disabled", True)
+
+    def start(self, name):
+        # In this process instead of a new one
+        try:
+            Runner(self.workspace.folder, name).run()
+        except OSError:
+            pass
+
+    monkeypatch.setattr(builds.Builds, "start", start)
+    services = services_for(workspace)
+    create_app(services)
+    await user.open("/")
+    user.find(marker="settings").click()
+    user.find(marker="settings-new-build").click()
+    user.find(marker="build-name").type("built")
+    user.find(marker="build-documents").type("fake.documents")
+    user.find(marker="build-start").click()
+    await user.should_see(marker="build-error")
+    await user.should_see("OSError: network down")
+    await user.should_see("3 / 5 documents", marker="build-stage-docstore")
+
+    documents.fail_after = None
+    user.find(marker="build-resume").click()
+    await user.should_see("done", marker="build-state")
+    assert documents.starts == [0, 2]
+    assert services.builds.register_completed() == ["built"]
+    await user.should_see(marker="build-open")
+    collection = workspace.collection("built")
+    assert collection.index == "indexes/built/index"
+
+    # The name is taken
+    user.find(marker="settings-new-build").click()
+    user.find(marker="build-name").type("built")
+    user.find(marker="build-documents").type("fake.documents")
+    user.find(marker="build-start").click()
+    await user.should_see("already exists", marker="build-status")

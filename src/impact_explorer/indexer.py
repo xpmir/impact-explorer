@@ -1,6 +1,5 @@
 """Builds a BOW index + document store from datamaestro documents."""
 
-import json
 import logging
 from collections.abc import Iterable
 from pathlib import Path
@@ -27,6 +26,8 @@ def build_collection(
     """
     import impact_index
 
+    from .builds import document_content, indexed_text
+
     folder = Path(folder)
     (folder / "docstore").mkdir(parents=True, exist_ok=True)
     options = {"stop_words": stop_words, "positions": positions}
@@ -39,14 +40,8 @@ def build_collection(
 
     count = 0
     for docid, document in enumerate(documents):
-        content = {"text": document.text}
-        if document.title:
-            content["title"] = document.title
-        store.add({"id": document.docid}, json.dumps(content).encode("utf-8"))
-        indexed = (
-            f"{document.title}\n{document.text}" if document.title else document.text
-        )
-        builder.add_text(docid, indexed)
+        store.add({"id": document.docid}, document_content(document))
+        builder.add_text(docid, indexed_text(document))
         count = docid + 1
         if count % log_every == 0:
             logger.info("Indexed %d documents", count)

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from nicegui import run, ui
 
 from .batch import BatchRun, BatchRuns, RunKey, SavedResult, fingerprint
+from .builds import Builds
 from .config import BM25Params, ConfigError, Workspace
 from .documents import Document
 from .engine import Engines, SearchEngine, SearchResult
@@ -89,6 +90,7 @@ class Services:
         workspace.on_change(self.batch_runs.invalidate)
         self.rewriters = rewriters or Rewriters()
         workspace.on_rewriter_change(self.rewriters.invalidate)
+        self.builds = Builds(workspace)
 
 
 def ms(seconds: float) -> str:

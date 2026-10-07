@@ -1,4 +1,5 @@
-"""Workspace settings dialog: collections, index paths and datasets."""
+"""Workspace settings dialog: collections, index paths and datasets,
+rewriters, and index builds."""
 
 import json
 import logging
@@ -8,6 +9,15 @@ from typing import TYPE_CHECKING
 
 from nicegui import run, ui
 
+from .builds import (
+    PIPELINES,
+    STAGE_LABELS,
+    STAGES,
+    STOP_WORDS,
+    BuildSpec,
+    BuildState,
+    iter_states,
+)
 from .checks import (
     Check,
     Status,
@@ -22,6 +32,15 @@ if TYPE_CHECKING:
     from .ui import Services
 
 logger = logging.getLogger(__name__)
+
+BUILD_STATUS_STYLE = {
+    "pending": ("schedule", "grey"),
+    "running": ("sync", "primary"),
+    "done": ("check_circle", "positive"),
+    "failed": ("error", "negative"),
+    "cancelled": ("pause_circle", "warning"),
+    "interrupted": ("pause_circle", "warning"),
+}
 
 STATUS_STYLE = {
     Status.OK: ("check_circle", "positive"),
@@ -186,8 +205,14 @@ class SettingsDialog:
                     ui.button(
                         "New", icon="add", on_click=lambda: self.edit_rewriter(None)
                     ).props("flat dense no-caps").mark("settings-new-rewriter")
-                self.form = ui.column().classes("grow gap-2")
+                    ui.label("Index builds").classes("text-sm font-medium mt-4")
+                    self.build_list = ui.column().classes("w-full gap-0")
+                    ui.button(
+                        "New", icon="add", on_click=lambda: self.edit_build(None)
+                    ).props("flat dense no-caps").mark("settings-new-build")
+                self.form = ui.column().classes("grow gap-2 min-w-0")
         self.editing_rewriter: str | None = None
+        self.editing_build: str | None = None
         self.edit(current if current in self.workspace.collections else None)
 
     def open(self):
@@ -211,6 +236,20 @@ class SettingsDialog:
                 ).classes("w-full text-left break-all").mark(
                     f"settings-rewriter-{name}"
                 )
+        self.build_list.clear()
+        with self.build_list:
+            for name, state, alive in iter_states(self.services.builds):
+                status = state.status(alive)
+                icon, color = BUILD_STATUS_STYLE[status]
+                selected = name == self.editing_build
+                ui.button(
+                    name, icon=icon, on_click=lambda n=name: self.edit_build(n)
+                ).props(
+                    "flat dense no-caps align=left"
+                    + (" color=primary" if selected else " color=grey-9")
+                ).classes("w-full text-left break-all").mark(
+                    f"settings-build-{name}"
+                ).tooltip(status)
 
     def edit_rewriter(self, name: str | None):
         from .rewriters import (
@@ -224,7 +263,7 @@ class SettingsDialog:
             set_group_beam_search,
         )
 
-        self.editing, self.editing_rewriter = None, name
+        self.editing, self.editing_rewriter, self.editing_build = None, name, None
         self.refresh_list()
         existing = self.workspace.rewriters.get(name) if name else None
         r = existing or RewriterConfig.preset("")
@@ -339,6 +378,20 @@ class SettingsDialog:
                     indent=1,
                 )
 
+            def pristine() -> bool:
+                """The form still holds the generic defaults"""
+                default = RewriterConfig(name="")
+                try:
+                    params = json.loads(generation.value or "{}")
+                except ValueError:
+                    return False
+                return (
+                    (system_prompt.value or "") == default.system_prompt
+                    and (user_template.value or "{query}") == default.user_template
+                    and combination.combine == default.combine
+                    and set_group_beam_search(params, False) == default.generation
+                )
+
             def auto_preset():
                 # Only fills an empty form: never overwrites edits
                 if find_preset(model_name()) is not None and pristine():
@@ -377,20 +430,6 @@ class SettingsDialog:
             def run_check(rewriter: RewriterConfig) -> Check:
                 ok, message = check(rewriter)
                 return Check.ok(message) if ok else Check.error(message)
-
-            def pristine() -> bool:
-                """The form still holds the generic defaults"""
-                default = RewriterConfig(name="")
-                try:
-                    params = json.loads(generation.value or "{}")
-                except ValueError:
-                    return False
-                return (
-                    (system_prompt.value or "") == default.system_prompt
-                    and (user_template.value or "{query}") == default.user_template
-                    and combination.combine == default.combine
-                    and set_group_beam_search(params, False) == default.generation
-                )
 
             async def do_check():
                 try:
@@ -445,7 +484,7 @@ class SettingsDialog:
 
     def edit(self, name: str | None):
         self.editing = name
-        self.editing_rewriter = None
+        self.editing_rewriter = self.editing_build = None
         self.refresh_list()
         existing = self.workspace.collections.get(name) if name else None
         c = (
@@ -693,3 +732,300 @@ class SettingsDialog:
                     "outline"
                 ).tooltip("Checks are run when the dialog opens and fields change")
                 ui.button("Save", icon="save", on_click=save).mark("settings-save")
+
+    # --- Index builds
+
+    def edit_build(self, name: str | None):
+        self.editing, self.editing_rewriter, self.editing_build = None, None, name
+        self.refresh_list()
+        self.form.clear()
+        with self.form:
+            if name is None:
+                self.new_build_form()
+            else:
+                BuildView(self, name)
+
+    def new_build_form(self):
+        builds = self.services.builds
+        ui.label("New index build").classes("font-medium")
+        ui.label(
+            "Downloads datamaestro documents, stores them in a document store "
+            "and builds a BOW index, then adds the collection to the "
+            "workspace. The build runs in its own process: it goes on if the "
+            "interface stops, and can be resumed after a failure."
+        ).classes("text-xs text-grey-7")
+        name = (
+            ui.input("Name (also the collection's)", placeholder="e.g. msmarco-passage")
+            .classes("w-full")
+            .mark("build-name")
+        )
+        documents = (
+            ui.input(
+                "datamaestro documents",
+                placeholder="e.g. com.microsoft.msmarco.passage.documents",
+            )
+            .classes("w-full font-mono")
+            .mark("build-documents")
+        )
+        output = (
+            ui.input("Output folder", placeholder="default: indexes/<name>")
+            .classes("w-full font-mono")
+            .mark("build-output")
+        )
+        ui.label(
+            f"Relative paths are resolved against {self.workspace.folder}"
+        ).classes("text-xs text-grey-6 -mt-2")
+        with ui.row().classes("gap-2 items-center"):
+            pipeline = ui.select(list(PIPELINES), value="pyserini", label="Pipeline")
+            pipeline.props("dense").classes("w-40")
+            stop_words = ui.select(
+                list(STOP_WORDS), value="default", label="Stop words"
+            )
+            stop_words.props("dense").classes("w-40").tooltip(
+                "default: the pipeline's own list (terrier-pisa filters queries only)"
+            )
+            positions = ui.checkbox("Positions").tooltip(
+                "Stores token positions (needed for #1 and #uwN queries)"
+            )
+        datasets = (
+            ui.input_chips(
+                "datamaestro IR datasets (topics + assessments)",
+                value=[],
+                new_value_mode="add-unique",
+            )
+            .props("dense outlined")
+            .classes("w-full")
+            .mark("build-datasets")
+        )
+        status = ui.label().classes("text-sm").mark("build-status")
+
+        def start():
+            spec = BuildSpec(
+                name=(name.value or "").strip(),
+                documents=(documents.value or "").strip(),
+                output=(output.value or "").strip(),
+                pipeline=pipeline.value,
+                stop_words=stop_words.value,
+                positions=bool(positions.value),
+                datasets=[d.strip() for d in datasets.value or [] if d.strip()],
+            )
+            try:
+                builds.create(spec)
+            except (ConfigError, OSError) as e:
+                status.text = f"Cannot start: {e}"
+                status.classes(replace="text-sm text-negative")
+                return
+            self.edit_build(spec.name)
+
+        with ui.row().classes("w-full justify-end mt-2"):
+            ui.button("Start", icon="play_arrow", on_click=start).mark("build-start")
+
+
+def duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
+def stage_progress(state: BuildState, stage: str, running: bool) -> str:
+    current = state.stages[stage]
+    if current.status == "pending" and current.done == 0:
+        return ""
+    parts = []
+    if current.total:
+        parts.append(f"{current.done:,} / {current.total:,} documents")
+    elif current.done:
+        parts.append(f"{current.done:,} documents")
+    rate = current.rate()
+    if rate:
+        parts.append(f"{rate:,.0f}/s")
+    if running and current.status == "running":
+        if current.total and current.done >= current.total and stage == "index":
+            parts.append("writing the index")
+        elif rate and current.total:
+            parts.append(f"{duration((current.total - current.done) / rate)} left")
+    elif current.started and current.finished:
+        parts.append(f"in {duration(current.finished - current.started)}")
+    return " · ".join(parts)
+
+
+class BuildView:
+    """State of a build, refreshed while it is displayed"""
+
+    def __init__(self, dialog: SettingsDialog, name: str):
+        self.dialog = dialog
+        self.builds = dialog.services.builds
+        self.name = name
+        self.last: tuple | None = None
+        with ui.row().classes("w-full items-center"):
+            ui.label(f"Index build {name}").classes("font-medium")
+            ui.space()
+            self.status = ui.label().classes("text-sm").mark("build-state")
+        self.summary = ui.label().classes("text-xs text-grey-7 font-mono break-all")
+        self.stages = ui.column().classes("w-full gap-1")
+        self.error = ui.column().classes("w-full gap-1")
+        with ui.expansion("Log").classes("w-full").props("dense"):
+            self.log = (
+                ui.code("")
+                .classes("w-full text-xs max-h-64 overflow-auto")
+                .mark("build-log")
+            )
+        self.buttons = ui.row().classes("w-full justify-end gap-2 mt-2")
+        self.refresh()
+        ui.timer(1.0, self.refresh)
+
+    def refresh(self):
+        try:
+            state, alive = self.builds.get(self.name)
+        except (OSError, ValueError, TypeError):
+            self.status.text = "Unknown build (removed?)"
+            return
+        self.log.content = self.builds.files(self.name).log_tail()
+        key = (json.dumps(state.to_dict(), sort_keys=True), alive)
+        if key == self.last:
+            return
+        previous_status = None
+        if self.last is not None:
+            previous_status = BuildState.from_dict(json.loads(self.last[0])).status(
+                self.last[1]
+            )
+        self.last = key
+        status = state.status(alive)
+        if previous_status is not None and previous_status != status:
+            self.dialog.refresh_list()
+        self.render(state, alive, status)
+
+    def render(self, state: BuildState, alive: bool, status: str):
+        icon, color = BUILD_STATUS_STYLE[status]
+        self.status.text = status
+        self.status.classes(replace=f"text-sm text-{color}")
+        spec = state.spec
+        output = spec.output_path(self.dialog.workspace.folder)
+        self.summary.text = (
+            f"{spec.documents} → {output} · {spec.pipeline}, stop words "
+            f"{spec.stop_words}{', positions' if spec.positions else ''}"
+        )
+        self.stages.clear()
+        with self.stages:
+            for stage in STAGES:
+                current = state.stages[stage]
+                stage_status = current.status
+                if stage_status == "running" and not alive:
+                    stage_status = "interrupted"
+                stage_icon, stage_color = BUILD_STATUS_STYLE.get(
+                    stage_status, BUILD_STATUS_STYLE["pending"]
+                )
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    if stage_status == "running":
+                        ui.spinner(size="xs")
+                    else:
+                        ui.icon(stage_icon, size="xs").props(f"color={stage_color}")
+                    ui.label(STAGE_LABELS[stage]).classes("text-sm w-36")
+                    ui.label(stage_progress(state, stage, alive)).classes(
+                        "text-xs text-grey-7"
+                    ).mark(f"build-stage-{stage}")
+                if current.total and stage_status in ("running", "interrupted"):
+                    ui.linear_progress(
+                        value=min(1.0, current.done / current.total),
+                        show_value=False,
+                    ).props("rounded")
+        self.error.clear()
+        if state.error and not alive:
+            with self.error:
+                ui.label(state.error).classes("text-sm text-negative break-all").mark(
+                    "build-error"
+                )
+                if state.traceback:
+                    with ui.expansion("Traceback").classes("w-full").props("dense"):
+                        ui.code(state.traceback).classes("w-full text-xs")
+        if status == "interrupted":
+            with self.error:
+                ui.label(
+                    "The build process stopped (interface or machine restart, "
+                    "killed process): resume it to go on where it stopped."
+                ).classes("text-sm text-warning")
+        if state.registered:
+            with self.error:
+                ui.label(f"Collection {spec.name!r} added to the workspace").classes(
+                    "text-sm text-positive"
+                )
+        self.render_buttons(state, status)
+
+    def render_buttons(self, state: BuildState, status: str):
+        self.buttons.clear()
+        with self.buttons:
+            if status != "running":
+                ui.button("Remove", icon="delete", on_click=self.remove).props(
+                    "flat color=negative"
+                ).tooltip("Forgets the build; its index and document store are kept")
+            ui.space()
+            if status == "running":
+                ui.button("Cancel", icon="stop", on_click=self.cancel).props(
+                    "outline color=negative"
+                ).mark("build-cancel")
+            else:
+                if status != "pending":
+                    ui.button(
+                        "Restart from scratch", icon="restart_alt", on_click=self.reset
+                    ).props("flat").mark("build-reset")
+                if status != "done":
+                    ui.button(
+                        "Resume" if status != "pending" else "Start",
+                        icon="play_arrow",
+                        on_click=self.resume,
+                    ).mark("build-resume").tooltip(
+                        "Completed stages are skipped; the document store "
+                        "resumes from its last checkpoint"
+                    )
+                elif state.registered:
+                    ui.button(
+                        "Open collection",
+                        icon="open_in_new",
+                        on_click=lambda: self.dialog.on_saved(state.spec.name),
+                    ).mark("build-open")
+
+    def act(self, action, message: str | None = None):
+        try:
+            action(self.name)
+        except (ConfigError, OSError) as e:
+            ui.notify(str(e), type="negative")
+            return
+        if message:
+            ui.notify(message)
+        self.last = None
+        # Let the process start before refreshing
+        ui.timer(0.5, self.refresh, once=True)
+
+    def resume(self):
+        self.act(self.builds.start)
+
+    def cancel(self):
+        self.act(self.builds.cancel, "Cancelling…")
+
+    def reset(self):
+        with ui.dialog() as confirm, ui.card():
+            ui.label(f"Restart build {self.name!r} from scratch?")
+            ui.label("Its document store and index are deleted and rebuilt.").classes(
+                "text-sm text-grey-8"
+            )
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=confirm.close).props("flat")
+
+                def do_reset():
+                    confirm.close()
+                    self.act(self.builds.reset)
+                    self.act(self.builds.start)
+
+                ui.button("Restart", on_click=do_reset).props("color=negative")
+        confirm.open()
+
+    def remove(self):
+        try:
+            self.builds.remove(self.name)
+        except (ConfigError, OSError) as e:
+            ui.notify(str(e), type="negative")
+            return
+        self.dialog.edit_build(None)

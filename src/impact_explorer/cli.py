@@ -1,4 +1,5 @@
-"""Command line: serve a workspace, or index a datamaestro collection."""
+"""Command line: serve a workspace, index a datamaestro collection, or run
+an index build started from the interface."""
 
 import argparse
 import logging
@@ -13,7 +14,11 @@ def serve(args):
 
     workspace = Workspace(args.workspace)
     workspace.folder.mkdir(parents=True, exist_ok=True)
-    create_app(Services(workspace))
+    services = Services(workspace)
+    # Index builds completed while the interface was not running, then the
+    # next ones
+    services.builds.watch()
+    create_app(services)
     ui.run(
         host=args.host,
         port=args.port,
@@ -63,6 +68,12 @@ def index(args):
             )
         )
         logging.info("Added collection to workspace %s", workspace.folder)
+
+
+def build(args):
+    from .builds import run_build
+
+    run_build(Path(args.workspace).expanduser().resolve(), args.name)
 
 
 def main(argv=None):
@@ -116,6 +127,14 @@ def main(argv=None):
         help="datamaestro IR dataset providing topics/assessments (repeatable)",
     )
     p.set_defaults(func=index)
+
+    p = commands.add_parser(
+        "build",
+        help="Runs (or resumes) an index build created in the interface",
+    )
+    p.add_argument("workspace", help="Workspace folder")
+    p.add_argument("name", help="Build name")
+    p.set_defaults(func=build)
 
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
