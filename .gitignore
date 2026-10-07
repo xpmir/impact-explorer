@@ -13,3 +13,5 @@ workspace.json
 saved-queries.json
 workspace.json.bak
 evaluations/
+builds/
+indexes/

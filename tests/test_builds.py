@@ -17,6 +17,7 @@ class FakeDocuments:
         self.fail_after = fail_after
         self.starts = []
 
+    @property
     def documentcount(self):
         return len(DOCUMENTS)
 
@@ -79,6 +80,7 @@ def test_build_and_register(builds, fake):
     state = files.load()
     assert state.complete and state.status(False) == "done"
     assert state.stages["index"].done == len(DOCUMENTS)
+    assert state.stages["docstore"].total == len(DOCUMENTS)
     assert stored_ids(builds) == [d.docid for d in DOCUMENTS]
 
     assert builds.register_completed() == ["fake"]
@@ -227,3 +229,30 @@ def test_catalog():
         catalog.topics_for("org.beir.scifact.collection")
     )
     assert sorted(options) == catalog.topics
+
+
+def test_download_errors(monkeypatch):
+    """datamaestro only logs download failures: they must stop the build"""
+    import sys
+
+    from datamaestro.context import Context
+
+    from impact_explorer.builds import DownloadError, download
+
+    class Wrapper:
+        def download(self):
+            print("Traceback (most recent call last):", file=sys.stderr)
+            print("ModuleNotFoundError: No module named 'pandas'", file=sys.stderr)
+            return False
+
+    context = Context.instance()
+    monkeypatch.setattr(type(context), "dataset", lambda self, i: Wrapper())
+    with pytest.raises(DownloadError, match="No module named 'pandas'"):
+        download("some.documents")
+
+    def unknown(self, i):
+        raise Exception(f"Dataset {i} not found")
+
+    monkeypatch.setattr(type(context), "dataset", unknown)
+    with pytest.raises(DownloadError, match="Unknown datamaestro dataset"):
+        download("no.such.dataset")

@@ -25,7 +25,9 @@ complete (the runner never writes ``workspace.json``, which the interface
 keeps in memory).
 """
 
+import contextlib
 import fcntl
+import io
 import itertools
 import json
 import logging
@@ -330,6 +332,7 @@ class Runner:
         if self._dataset is None:
             from datamaestro import prepare_dataset
 
+            download(self.spec.documents)
             dataset = prepare_dataset(self.spec.documents)
             self._dataset = getattr(dataset, "documents", dataset)
         return self._dataset
@@ -337,7 +340,11 @@ class Runner:
     def stage_prepare(self, stage: StageState):
         documents = self.dataset()
         try:
-            self.state.stages["docstore"].total = int(documents.documentcount())
+            # A property or a method, depending on the dataset type
+            count = documents.documentcount
+            self.state.stages["docstore"].total = int(
+                count() if callable(count) else count
+            )
         except Exception:
             logger.info("Unknown number of documents")
 
@@ -402,6 +409,45 @@ class Runner:
         logger.info("Writing the index")
         self.save()
         builder.build(in_memory=False)
+
+
+class DownloadError(RuntimeError):
+    pass
+
+
+class _Tee(io.TextIOBase):
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def download(dataset_id: str):
+    """Downloads a datamaestro dataset (and the datasets it references)
+
+    datamaestro only logs download failures (``prepare_dataset`` returns the
+    dataset anyway): they are raised here, with their cause (the last line
+    of the traceback datamaestro prints)."""
+    from datamaestro.context import Context
+
+    try:
+        wrapper = Context.instance().dataset(dataset_id)
+    except Exception:
+        raise DownloadError(f"Unknown datamaestro dataset {dataset_id!r}") from None
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(_Tee(sys.stderr, captured)):
+        success = wrapper.download()
+    if not success:
+        lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+        cause = f": {lines[-1].strip()}" if lines else " (see the log)"
+        raise DownloadError(f"Could not download {dataset_id}{cause}")
 
 
 def run_build(workspace: Path, name: str):
