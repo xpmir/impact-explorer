@@ -218,10 +218,10 @@ class SettingsDialog:
             GROUP_BEAM_SEARCH,
             PRESETS,
             RewriterConfig,
-            allow_group_beam_search,
             check,
             find_preset,
-            group_beam_search_allowed,
+            group_beam_search_enabled,
+            set_group_beam_search,
         )
 
         self.editing, self.editing_rewriter = None, name
@@ -282,15 +282,16 @@ class SettingsDialog:
             )
             allow_remote = (
                 ui.checkbox(
-                    "Allow group beam search (runs code from "
-                    f"hf.co/{GROUP_BEAM_SEARCH})",
-                    value=group_beam_search_allowed(r.generation),
+                    f"Group beam search (runs code from hf.co/{GROUP_BEAM_SEARCH})",
+                    value=group_beam_search_enabled(r.generation),
                 )
                 .classes("text-sm")
                 .tooltip(
-                    "transformers moved group beam search (num_beam_groups, "
-                    "used by STORM) to a Hub repository: generating with it "
-                    "downloads and executes that code"
+                    "STORM's best setting (num_beam_groups=3, "
+                    "diversity_penalty=1.0); transformers moved group beam "
+                    "search to a Hub repository: generating with it downloads "
+                    "and executes that code. Unchecked: the model's decoding "
+                    "(plain beam search for STORM)"
                 )
                 .mark("rewriter-allow-remote")
             )
@@ -301,7 +302,7 @@ class SettingsDialog:
                 except ValueError:
                     return
                 generation.value = json.dumps(
-                    allow_group_beam_search(params, e.value), indent=1
+                    set_group_beam_search(params, e.value), indent=1
                 )
 
             allow_remote.on_value_change(on_allow)
@@ -334,13 +335,13 @@ class SettingsDialog:
                 user_template.value = preset.user_template
                 combination.set(preset.combine, preset.query_weight)
                 generation.value = json.dumps(
-                    allow_group_beam_search(preset.generation, allow_remote.value),
+                    set_group_beam_search(preset.generation, allow_remote.value),
                     indent=1,
                 )
 
             def auto_preset():
                 # Only fills an empty form: never overwrites edits
-                if find_preset(model_name()) is not None and not system_prompt.value:
+                if find_preset(model_name()) is not None and pristine():
                     apply_preset()
 
             if not existing:
@@ -376,6 +377,20 @@ class SettingsDialog:
             def run_check(rewriter: RewriterConfig) -> Check:
                 ok, message = check(rewriter)
                 return Check.ok(message) if ok else Check.error(message)
+
+            def pristine() -> bool:
+                """The form still holds the generic defaults"""
+                default = RewriterConfig(name="")
+                try:
+                    params = json.loads(generation.value or "{}")
+                except ValueError:
+                    return False
+                return (
+                    (system_prompt.value or "") == default.system_prompt
+                    and (user_template.value or "{query}") == default.user_template
+                    and combination.combine == default.combine
+                    and set_group_beam_search(params, False) == default.generation
+                )
 
             async def do_check():
                 try:

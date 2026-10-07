@@ -29,7 +29,6 @@ class FakeBackend:
 
 def test_keywords_and_combination():
     config = RewriterConfig.preset("Arthur-75/storm-qwen3-8B")
-    assert config.user_template.startswith("[QUERY]")
     result = make_rewrite(config, "quick fox", FakeBackend(config).generate("x"))
     assert result.outputs[0] == "fox, Vixen, den."
     assert result.keywords == ["fox", "Vixen", "den", "burrow"]
@@ -71,12 +70,12 @@ def test_model_ids():
 
 
 def test_group_beam_search_must_be_allowed():
-    preset = RewriterConfig.preset("Arthur-75/storm-qwen3-8B")
-    assert group_beam_search_problem(preset.generation)
-    ok, message = check(preset)
+    generation = {"num_beams": 6, "num_beam_groups": 3, "diversity_penalty": 1.0}
+    assert group_beam_search_problem(generation)
+    ok, message = check(RewriterConfig(name="r", generation=generation))
     assert not ok and GROUP_BEAM_SEARCH in message
     allowed = {
-        **preset.generation,
+        **generation,
         "custom_generate": GROUP_BEAM_SEARCH,
         "trust_remote_code": True,
     }
@@ -115,7 +114,7 @@ def test_workspace_rewriters(tmp_path):
     workspace.on_rewriter_change(changed.append)
     workspace.put_rewriter(RewriterConfig.preset("Arthur-75/storm-qwen3-8B"))
     loaded = Workspace(tmp_path).rewriters["Arthur-75/storm-qwen3-8B"]
-    assert loaded.generation["num_return_sequences"] == 3
+    assert loaded.combine == "{outputs}"
     workspace.remove_rewriter("Arthur-75/storm-qwen3-8B")
     assert Workspace(tmp_path).rewriters == {}
     assert changed == ["Arthur-75/storm-qwen3-8B"] * 2
@@ -125,10 +124,14 @@ def test_storm_presets():
     from impact_explorer.rewriters import PRESETS, find_preset
 
     assert len(PRESETS) == 4
-    for size, tokens in [("0.6B", 32), ("1.7B", 32), ("4B", 64), ("8B", 64)]:
+    for size in ["0.6B", "1.7B", "4B", "8B"]:
         preset = RewriterConfig.preset(f"Arthur-75/storm-qwen3-{size}")
-        assert preset.generation["max_new_tokens"] == tokens
-        assert preset.user_template == "[QUERY]: {query}\n[KEYWORDS]: "
+        # The model's chat template and generation_config.json do the rest
+        assert (preset.system_prompt, preset.user_template) == ("", "{query}")
+        assert (preset.generation, preset.combine) == ({}, "{outputs}")
+    # Presets are copies
+    RewriterConfig.preset("Arthur-75/storm-qwen3-8B").generation["x"] = 1
+    assert RewriterConfig.preset("Arthur-75/storm-qwen3-8B").generation == {}
     assert find_preset("https://huggingface.co/arthur-75/STORM-qwen3-0.6B")
     assert find_preset("Qwen/Qwen3-0.6B") is None
 
@@ -136,18 +139,55 @@ def test_storm_presets():
 def test_preset_from_model_field():
     preset = RewriterConfig.preset("Storm (Qwen3-0.6B)", "Arthur-75/storm-qwen3-0.6B")
     assert preset.name == "Storm (Qwen3-0.6B)"
-    assert preset.generation["max_new_tokens"] == 32
-    assert RewriterConfig.preset("Storm", None).generation == {}
+    assert preset.combine == "{outputs}"
+    assert RewriterConfig.preset("Storm", None).combine == "{query} {keywords}"
 
 
-def test_allow_group_beam_search():
+def test_group_beam_search():
     from impact_explorer.rewriters import (
-        allow_group_beam_search,
-        group_beam_search_allowed,
+        group_beam_search_enabled,
+        set_group_beam_search,
     )
 
-    preset = RewriterConfig.preset("Arthur-75/storm-qwen3-0.6B").generation
-    allowed = allow_group_beam_search(preset, True)
-    assert group_beam_search_allowed(allowed)
-    assert group_beam_search_problem(allowed) is None
-    assert allow_group_beam_search(allowed, False) == preset
+    enabled = set_group_beam_search({}, True)
+    assert enabled == {
+        "num_beam_groups": 3,
+        "diversity_penalty": 1.0,
+        "custom_generate": GROUP_BEAM_SEARCH,
+        "trust_remote_code": True,
+    }
+    assert group_beam_search_enabled(enabled)
+    assert group_beam_search_problem(enabled) is None
+    assert set_group_beam_search(enabled, False) == {}
+    # Explicit values are kept
+    assert set_group_beam_search({"num_beam_groups": 2}, True)["num_beam_groups"] == 2
+
+
+def test_openai_payload(monkeypatch):
+    import httpx
+
+    from impact_explorer.rewriters import OpenAIBackend
+
+    payloads = []
+
+    def post(url, json, timeout):
+        payloads.append(json)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "a, b"}}]},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", post)
+    config = RewriterConfig.preset("Arthur-75/storm-qwen3-8B")
+    config.backend, config.url = "openai", "http://x/v1"
+    assert OpenAIBackend(config).generate("fox") == ["a, b"]
+    # Only the query, greedy; the rest is the server's (model's) defaults
+    assert payloads[-1] == {
+        "model": "Arthur-75/storm-qwen3-8B",
+        "messages": [{"role": "user", "content": "fox"}],
+        "temperature": 0.0,
+    }
+    config.generation = {"num_return_sequences": 3, "max_new_tokens": 32}
+    OpenAIBackend(config).generate("fox")
+    assert (payloads[-1]["n"], payloads[-1]["max_tokens"]) == (3, 32)

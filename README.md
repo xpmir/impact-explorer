@@ -98,15 +98,25 @@ known model (e.g. `Arthur-75/storm-qwen3-8B`) fills in its preset.
 
 - `transformers` backend: the model runs locally (cuda, mps or cpu); it is
   downloaded and loaded the first time it is used.
+Empty fields defer to the model: with an empty system prompt and `{query}`
+as user template, the model's chat template builds the prompt, and the
+generation parameters missing from the JSON come from its
+`generation_config.json` ("Model's own" button). The STORM preset relies on
+this: its repositories hold the prompt (system prompt, `[QUERY]: …`
+wrapping) and the decoding (beam search, 3 outputs).
+
 - `openai` backend: any OpenAI-compatible server, e.g.
   `vllm serve Arthur-75/storm-qwen3-8B`, with its URL
   (`http://host:8000/v1`).
 
-Group beam search (`num_beam_groups`, used by STORM) is no longer part of
-transformers: it runs code from the Hub
-(`transformers-community/group-beam-search`), which you have to allow
-explicitly ("Allow group beam search" in the rewriter's settings) — or use
-plain beam search instead.
+Group beam search (`num_beam_groups=3`, `diversity_penalty=1.0`: STORM's
+best setting, slightly above the default plain beam search) is no longer
+part of transformers: it runs code from the Hub
+(`transformers-community/group-beam-search`), so it is an explicit opt-in
+("Group beam search" in the rewriter's settings). With the `openai`
+backend, only the parameters set in the JSON are sent (plus greedy
+decoding unless `do_sample` is true): vLLM does not do beam search through
+the chat API.
 
 A saved query can be opened directly with `/?saved=<id>`, and a collection
 with `/?collection=<name>`.

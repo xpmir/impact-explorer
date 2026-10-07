@@ -12,6 +12,7 @@ Two backends:
   serve``), for models too large to run locally.
 """
 
+import copy
 import logging
 import re
 import threading
@@ -38,38 +39,28 @@ def combination_name(template: str) -> str | None:
     return None
 
 
-def storm_preset(max_new_tokens: int) -> dict:
-    """STORM: lexical query expansion for BM25 (Qwen3 fine-tuned), as in
-    the model cards and https://github.com/arthur-75/storm; only
-    max_new_tokens differs between sizes.
+STORM_PRESET: dict = {
+    "system_prompt": "",
+    "user_template": "{query}",
+    "combine": "{outputs}",
+    "generation": {},
+}
+"""STORM: lexical query expansion for BM25 (Qwen3 fine-tuned), see
+https://github.com/arthur-75/storm. The model repositories hold the prompt
+(the chat template adds the system prompt and wraps the query as
+``[QUERY]: …\n[KEYWORDS]: ``) and the decoding (``generation_config.json``:
+beam search, 3 outputs, 32 or 64 new tokens), so only the query is sent.
+Group beam search (the paper's setting) is an opt-in, as it runs code from
+the Hub (:func:`set_group_beam_search`).
 
-    The searched query is the concatenation of the raw outputs (repeated
-    words weigh more, as with Lucene): the model is trained with the
-    generated text alone as the BM25 query, and learns to repeat the query
-    terms itself"""
-    return {
-        "system_prompt": (
-            "From the query generate new semantic related keywords.\n"
-            "Output the result strictly as a single comma-separated line."
-        ),
-        "user_template": "[QUERY]: {query}\n[KEYWORDS]: ",
-        "combine": "{outputs}",
-        "generation": {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": False,
-            "num_beams": 6,
-            "num_beam_groups": 3,
-            "diversity_penalty": 1.0,
-            "num_return_sequences": 3,
-        },
-    }
+The searched query is the concatenation of the raw outputs (repeated words
+weigh more, as with Lucene): the model is trained with the generated text
+alone as the BM25 query, and learns to repeat the query terms itself"""
 
 
 PRESETS: dict[str, dict] = {
-    "Arthur-75/storm-qwen3-0.6B": storm_preset(32),
-    "Arthur-75/storm-qwen3-1.7B": storm_preset(32),
-    "Arthur-75/storm-qwen3-4B": storm_preset(64),
-    "Arthur-75/storm-qwen3-8B": storm_preset(64),
+    f"Arthur-75/storm-qwen3-{size}": STORM_PRESET
+    for size in ("0.6B", "1.7B", "4B", "8B")
 }
 
 
@@ -98,6 +89,10 @@ def hf_repo_id(value: str) -> str:
     return value
 
 
+GROUP_BEAM_SEARCH_PARAMETERS = {"num_beam_groups": 3, "diversity_penalty": 1.0}
+"""STORM's best configuration (with the model's ``num_beams=6``)"""
+
+
 def group_beam_search_problem(generation: dict) -> str | None:
     """Group beam search (``num_beam_groups``) is no longer part of
     transformers: it needs code from the Hub, which must be allowed
@@ -108,28 +103,34 @@ def group_beam_search_problem(generation: dict) -> str | None:
         return None
     return (
         "Group beam search (num_beam_groups) now runs code from "
-        f"https://hf.co/{GROUP_BEAM_SEARCH}: allow it in the rewriter's "
-        'settings ("Allow group beam search"), or remove num_beam_groups '
+        f"https://hf.co/{GROUP_BEAM_SEARCH}: enable it in the rewriter's "
+        'settings ("Group beam search"), or remove num_beam_groups '
         "and diversity_penalty there (plain beam search)"
     )
 
 
-def allow_group_beam_search(generation: dict, allow: bool) -> dict:
-    """Generation parameters with the Hub code allowed (or not)"""
+def set_group_beam_search(generation: dict, enable: bool) -> dict:
+    """Generation parameters with group beam search (and the Hub code it
+    needs) enabled or not"""
     generation = dict(generation)
-    if allow:
+    if enable:
+        for key, value in GROUP_BEAM_SEARCH_PARAMETERS.items():
+            generation.setdefault(key, value)
         generation["custom_generate"] = GROUP_BEAM_SEARCH
         generation["trust_remote_code"] = True
     else:
+        for key in GROUP_BEAM_SEARCH_PARAMETERS:
+            generation.pop(key, None)
         if generation.get("custom_generate") == GROUP_BEAM_SEARCH:
             generation.pop("custom_generate")
         generation.pop("trust_remote_code", None)
     return generation
 
 
-def group_beam_search_allowed(generation: dict) -> bool:
+def group_beam_search_enabled(generation: dict) -> bool:
     return (
-        generation.get("custom_generate") == GROUP_BEAM_SEARCH
+        generation.get("num_beam_groups", 1) > 1
+        and generation.get("custom_generate") == GROUP_BEAM_SEARCH
         and generation.get("trust_remote_code") is True
     )
 
@@ -210,9 +211,8 @@ class RewriterConfig:
         """A configuration for a known model (or the generic defaults); the
         model is ``model`` if given, else the name"""
         config = RewriterConfig(name=name, model=model or None)
-        return RewriterConfig(
-            name=name, model=model or None, **(find_preset(config.model_id) or {})
-        )
+        preset = copy.deepcopy(find_preset(config.model_id) or {})
+        return RewriterConfig(name=name, model=model or None, **preset)
 
 
 @dataclass
@@ -342,15 +342,17 @@ class TransformersBackend:
         inputs = self.tokenizer(
             prompt, return_tensors="pt", add_special_tokens=False
         ).to(self.device)
+        # Unset parameters come from the model's generation_config.json
         generation = dict(self.config.generation)
         if problem := group_beam_search_problem(generation):
             raise RewriterError(problem)
-        with self.torch.no_grad():
-            output = self.model.generate(
-                **inputs,
-                pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
-                **generation,
+        if self.model.generation_config.pad_token_id is None:
+            generation.setdefault(
+                "pad_token_id",
+                self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             )
+        with self.torch.no_grad():
+            output = self.model.generate(**inputs, **generation)
         start = inputs["input_ids"].shape[1]
         return [
             self.tokenizer.decode(sequence[start:], skip_special_tokens=True)
@@ -369,10 +371,20 @@ class OpenAIBackend:
         payload = {
             "model": self.config.model_id,
             "messages": messages(self.config, query),
-            "n": generation.get("num_return_sequences", 1),
-            "max_tokens": generation.get("max_new_tokens", 64),
-            "temperature": generation.get("temperature", 0.0),
         }
+        # Unset parameters: the server's defaults (vLLM takes max_new_tokens
+        # from generation_config.json, but not do_sample=False, hence the
+        # explicit greedy decoding)
+        for key, api_key in (
+            ("num_return_sequences", "n"),
+            ("max_new_tokens", "max_tokens"),
+            ("temperature", "temperature"),
+            ("top_p", "top_p"),
+        ):
+            if key in generation:
+                payload[api_key] = generation[key]
+        if not generation.get("do_sample", False):
+            payload.setdefault("temperature", 0.0)
         url = self.config.url.rstrip("/") + "/chat/completions"
         try:
             response = httpx.post(url, json=payload, timeout=120)

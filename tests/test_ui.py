@@ -361,8 +361,6 @@ async def test_register_rewriter(user: User, workspace):
     user.find(marker="settings").click()
     user.find(marker="settings-new-rewriter").click()
     user.find(marker="rewriter-name").type("Arthur-75/storm-qwen3-8B").trigger("blur")
-    system = user.find(marker="rewriter-system").elements.pop()
-    assert system.value.startswith("From the query generate")
     user.find(marker="rewriter-save").click()
     await user.should_see(marker="rewrite")
     assert workspace.rewriters["Arthur-75/storm-qwen3-8B"].combine == "{outputs}"
@@ -376,8 +374,10 @@ async def test_preset_for_other_storm_sizes(user: User, workspace):
     user.find(marker="rewriter-name").type(
         "https://huggingface.co/Arthur-75/storm-qwen3-0.6B"
     ).trigger("blur")
-    system = user.find(marker="rewriter-system").elements.pop()
-    assert system.value.startswith("From the query generate")
+    user.find(marker="rewriter-save").click()
+    await user.should_see(marker="rewrite")
+    rewriter = workspace.rewriters["https://huggingface.co/Arthur-75/storm-qwen3-0.6B"]
+    assert rewriter.combine == "{outputs}"
 
 
 async def test_rewriter_model_settings(user: User, workspace):
@@ -412,8 +412,7 @@ async def test_preset_uses_the_model_field(user: User, workspace):
     user.find(marker="rewriter-save").click()
     await user.should_see(marker="rewrite")
     saved = workspace.rewriters["Storm (Qwen3-0.6B)"]
-    assert saved.generation["max_new_tokens"] == 32
-    assert saved.user_template == "[QUERY]: {query}\n[KEYWORDS]: "
+    assert (saved.user_template, saved.combine) == ("{query}", "{outputs}")
 
 
 async def test_allow_group_beam_search_checkbox(user: User, workspace):
@@ -431,6 +430,7 @@ async def test_allow_group_beam_search_checkbox(user: User, workspace):
     generation = workspace.rewriters["Arthur-75/storm-qwen3-0.6B"].generation
     assert generation["trust_remote_code"] is True
     assert generation["num_beam_groups"] == 3
+    assert generation["diversity_penalty"] == 1.0
 
 
 async def test_index_info(user: User, workspace):
