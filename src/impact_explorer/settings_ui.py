@@ -1,6 +1,7 @@
 """Workspace settings dialog: collections, index paths and datasets,
 rewriters, and index builds."""
 
+import copy
 import json
 import logging
 from collections.abc import Callable
@@ -10,10 +11,7 @@ from typing import TYPE_CHECKING
 from nicegui import run, ui
 
 from .builds import (
-    PIPELINES,
     STAGE_LABELS,
-    STAGES,
-    STOP_WORDS,
     BuildSpec,
     BuildState,
     iter_states,
@@ -225,7 +223,7 @@ class SettingsDialog:
                 ui.button(name, on_click=lambda n=name: self.edit(n)).props(
                     "flat dense no-caps align=left"
                     + (" color=primary" if name == self.editing else " color=grey-9")
-                ).classes("w-full")
+                ).classes("w-full").mark(f"settings-collection-{name}")
         self.rewriter_list.clear()
         with self.rewriter_list:
             for name in self.workspace.rewriters:
@@ -694,27 +692,52 @@ class SettingsDialog:
 
             def delete():
                 n = len(self.services.store.list(name))
-                with ui.dialog() as confirm, ui.card():
+                builds = self.services.builds
+                folders = builds.collection_files(name)
+                with ui.dialog() as confirm, ui.card().classes("max-w-[40rem]"):
                     ui.label(f"Remove collection {name!r} from the workspace?")
-                    ui.label(
-                        "The index files are not deleted."
-                        + (
-                            f" Its {n} saved queries are kept and come back if a "
-                            "collection with the same name is added."
-                            if n
-                            else ""
+                    delete_files = None
+                    if folders:
+                        # Indexes outside the workspace may be shared
+                        inside = all(
+                            f.resolve().is_relative_to(self.workspace.folder)
+                            for f in folders
                         )
-                    ).classes("text-sm text-grey-8")
+                        delete_files = (
+                            ui.checkbox("Delete its files", value=inside)
+                            .classes("text-sm")
+                            .mark("collection-delete-files")
+                        )
+                        ui.label("\n".join(str(f) for f in folders)).classes(
+                            "text-xs font-mono text-grey-8 whitespace-pre-line "
+                            "break-all"
+                        )
+                    if n:
+                        ui.label(
+                            f"Its {n} saved queries are kept and come back if a "
+                            "collection with the same name is added."
+                        ).classes("text-sm text-grey-8")
                     with ui.row().classes("w-full justify-end"):
                         ui.button("Cancel", on_click=confirm.close).props("flat")
 
                         def do_delete():
                             confirm.close()
-                            self.workspace.remove(name)
+                            try:
+                                builds.remove_collection(
+                                    name,
+                                    delete_files=bool(
+                                        delete_files and delete_files.value
+                                    ),
+                                )
+                            except (ConfigError, OSError) as e:
+                                ui.notify(str(e), type="negative")
+                                return
                             self.dialog.close()
                             self.on_saved(None)
 
-                        ui.button("Remove", on_click=do_delete).props("color=negative")
+                        ui.button("Remove", on_click=do_delete).props(
+                            "color=negative"
+                        ).mark("collection-remove-confirm")
                 confirm.open()
 
             async def recheck():
@@ -726,7 +749,7 @@ class SettingsDialog:
                 if existing:
                     ui.button("Remove", icon="delete", on_click=delete).props(
                         "flat color=negative"
-                    )
+                    ).mark("collection-remove")
                 ui.space()
                 ui.button("Re-check", icon="refresh", on_click=recheck).props(
                     "outline"
@@ -750,7 +773,8 @@ class SettingsDialog:
         ui.label("New index build").classes("font-medium")
         ui.label(
             "Downloads datamaestro documents, stores them in a document store "
-            "and builds a BOW index, then adds the collection to the "
+            "(unless datamaestro already has one) and builds a BOW index, "
+            "then adds the collection to the "
             "workspace. The build runs in its own process: it goes on if the "
             "interface stops, and can be resumed after a failure."
         ).classes("text-xs text-grey-7")
@@ -786,18 +810,7 @@ class SettingsDialog:
         ui.label(
             f"Relative paths are resolved against {self.workspace.folder}"
         ).classes("text-xs text-grey-6 -mt-2")
-        with ui.row().classes("gap-2 items-center"):
-            pipeline = ui.select(list(PIPELINES), value="pyserini", label="Pipeline")
-            pipeline.props("dense").classes("w-40")
-            stop_words = ui.select(
-                list(STOP_WORDS), value="default", label="Stop words"
-            )
-            stop_words.props("dense").classes("w-40").tooltip(
-                "default: the pipeline's own list (terrier-pisa filters queries only)"
-            )
-            positions = ui.checkbox("Positions").tooltip(
-                "Stores token positions (needed for #1 and #uwN queries)"
-            )
+        options = IndexOptions(BuildSpec(name="", documents=""))
         datasets = (
             ui.select(
                 [],
@@ -855,14 +868,13 @@ class SettingsDialog:
         status = ui.label().classes("text-sm").mark("build-status")
 
         def start():
-            spec = BuildSpec(
-                name=(name.value or "").strip(),
-                documents=(documents.value or "").strip(),
-                output=(output.value or "").strip(),
-                pipeline=pipeline.value,
-                stop_words=stop_words.value,
-                positions=bool(positions.value),
-                datasets=[d.strip() for d in datasets.value or [] if d.strip()],
+            spec = options.apply(
+                BuildSpec(
+                    name=(name.value or "").strip(),
+                    documents=(documents.value or "").strip(),
+                    output=(output.value or "").strip(),
+                    datasets=[d.strip() for d in datasets.value or [] if d.strip()],
+                )
             )
             try:
                 builds.create(spec)
@@ -874,6 +886,69 @@ class SettingsDialog:
 
         with ui.row().classes("w-full justify-end mt-2"):
             ui.button("Start", icon="play_arrow", on_click=start).mark("build-start")
+
+
+PIPELINE_LABELS = {
+    "pyserini": "pyserini — Lucene tokenizer and stop words, Porter",
+    "terrier": "terrier — Terrier 5 stop words, Porter2",
+    "terrier-pisa": "terrier-pisa — as PISA (stop words removed from queries only)",
+}
+STOP_WORDS_LABELS = {
+    "default": "default (the pipeline's)",
+    "lucene": "lucene (~33 words)",
+    "terrier": "terrier (~730 words)",
+    "none": "none",
+}
+
+
+class IndexOptions:
+    """Index options of a build (text processing, positions, compression)"""
+
+    def __init__(self, spec: BuildSpec):
+        with ui.column().classes("w-full gap-1 border rounded p-2"):
+            ui.label("Index options").classes("text-sm font-medium")
+            with ui.row().classes("w-full gap-2 items-center no-wrap"):
+                self.pipeline = (
+                    ui.select(PIPELINE_LABELS, value=spec.pipeline, label="Pipeline")
+                    .props("dense")
+                    .classes("grow")
+                    .mark("build-pipeline")
+                    .tooltip("Tokenizer, stemmer and default stop words")
+                )
+                self.stop_words = (
+                    ui.select(
+                        STOP_WORDS_LABELS, value=spec.stop_words, label="Stop words"
+                    )
+                    .props("dense")
+                    .classes("w-52")
+                    .mark("build-stop-words")
+                )
+            self.positions = (
+                ui.checkbox(
+                    "Store positions — needed for phrase (#1) and window (#uwN) "
+                    "queries; a larger index",
+                    value=spec.positions,
+                )
+                .classes("text-sm")
+                .mark("build-positions")
+            )
+            self.compress = (
+                ui.checkbox(
+                    "Compress the index — bitpacked block-max postings "
+                    "(lossless, faster search); the uncompressed index is "
+                    "deleted",
+                    value=spec.compress,
+                )
+                .classes("text-sm")
+                .mark("build-compress")
+            )
+
+    def apply(self, spec: BuildSpec) -> BuildSpec:
+        spec.pipeline = self.pipeline.value
+        spec.stop_words = self.stop_words.value
+        spec.positions = bool(self.positions.value)
+        spec.compress = bool(self.compress.value)
+        return spec
 
 
 DOCUMENTS_SUFFIXES = (".documents", ".collection", ".docs", ".corpus")
@@ -900,6 +975,8 @@ def stage_progress(state: BuildState, stage: str, running: bool) -> str:
     current = state.stages[stage]
     if current.status == "pending" and current.done == 0:
         return ""
+    if stage == "docstore" and state.datamaestro_store:
+        return f"datamaestro's, used as is ({current.done:,} documents)"
     parts = []
     if current.total:
         parts.append(f"{current.done:,} / {current.total:,} documents")
@@ -909,7 +986,9 @@ def stage_progress(state: BuildState, stage: str, running: bool) -> str:
     if rate:
         parts.append(f"{rate:,.0f}/s")
     if running and current.status == "running":
-        if current.total and current.done >= current.total and stage == "index":
+        if stage == "compress":
+            parts.append("compressing the index")
+        elif current.total and current.done >= current.total and stage == "index":
             parts.append("writing the index")
         elif rate and current.total:
             parts.append(f"{duration((current.total - current.done) / rate)} left")
@@ -930,7 +1009,11 @@ class BuildView:
             ui.label(f"Index build {name}").classes("font-medium")
             ui.space()
             self.status = ui.label().classes("text-sm").mark("build-state")
-        self.summary = ui.label().classes("text-xs text-grey-7 font-mono break-all")
+        self.summary = (
+            ui.label()
+            .classes("text-xs text-grey-7 font-mono break-all")
+            .mark("build-state-summary")
+        )
         self.stages = ui.column().classes("w-full gap-1")
         self.error = ui.column().classes("w-full gap-1")
         with ui.expansion("Log").classes("w-full").props("dense"):
@@ -970,13 +1053,10 @@ class BuildView:
         self.status.classes(replace=f"text-sm text-{color}")
         spec = state.spec
         output = spec.output_path(self.dialog.workspace.folder)
-        self.summary.text = (
-            f"{spec.documents} → {output} · {spec.pipeline}, stop words "
-            f"{spec.stop_words}{', positions' if spec.positions else ''}"
-        )
+        self.summary.text = f"{spec.documents} → {output} · {spec.options_text()}"
         self.stages.clear()
         with self.stages:
-            for stage in STAGES:
+            for stage in spec.stages():
                 current = state.stages[stage]
                 stage_status = current.status
                 if stage_status == "running" and not alive:
@@ -1026,7 +1106,10 @@ class BuildView:
             if status != "running":
                 ui.button("Remove", icon="delete", on_click=self.remove).props(
                     "flat color=negative"
-                ).tooltip("Forgets the build; its index and document store are kept")
+                ).mark("build-remove").tooltip(
+                    "Forgets the build; its files are deleted unless its "
+                    "collection is in the workspace"
+                )
             ui.space()
             if status == "running":
                 ui.button("Cancel", icon="stop", on_click=self.cancel).props(
@@ -1035,8 +1118,10 @@ class BuildView:
             else:
                 if status != "pending":
                     ui.button(
-                        "Restart from scratch", icon="restart_alt", on_click=self.reset
-                    ).props("flat").mark("build-reset")
+                        "Rebuild…", icon="restart_alt", on_click=self.reset
+                    ).props("flat").mark("build-reset").tooltip(
+                        "Builds again, possibly with other index options"
+                    )
                 if status != "done":
                     ui.button(
                         "Resume" if status != "pending" else "Start",
@@ -1072,26 +1157,67 @@ class BuildView:
         self.act(self.builds.cancel, "Cancelling…")
 
     def reset(self):
-        with ui.dialog() as confirm, ui.card():
-            ui.label(f"Restart build {self.name!r} from scratch?")
-            ui.label("Its document store and index are deleted and rebuilt.").classes(
-                "text-sm text-grey-8"
+        state, _ = self.builds.get(self.name)
+        documents_ready = state.stages["docstore"].status == "done"
+        with ui.dialog() as confirm, ui.card().classes("w-[40rem] max-w-full"):
+            ui.label(f"Rebuild {self.name!r}").classes("font-medium")
+            options = IndexOptions(copy.deepcopy(state.spec))
+            again = (
+                ui.checkbox("Copy the documents again", value=not documents_ready)
+                .classes("text-sm")
+                .mark("build-copy-again")
+                .tooltip("Otherwise, only the index is rebuilt")
             )
+            if not documents_ready:
+                again.disable()
+            ui.label(
+                "The current index is deleted (the collection is unavailable "
+                "until the build completes)."
+            ).classes("text-sm text-grey-8")
             with ui.row().classes("w-full justify-end"):
                 ui.button("Cancel", on_click=confirm.close).props("flat")
 
                 def do_reset():
                     confirm.close()
-                    self.act(self.builds.reset)
+                    spec = options.apply(copy.deepcopy(state.spec))
+                    self.act(
+                        lambda name: self.builds.reset(
+                            name, spec, keep_documents=not again.value
+                        )
+                    )
                     self.act(self.builds.start)
 
-                ui.button("Restart", on_click=do_reset).props("color=negative")
+                ui.button("Rebuild", on_click=do_reset).props("color=negative").mark(
+                    "build-rebuild"
+                )
         confirm.open()
 
     def remove(self):
-        try:
-            self.builds.remove(self.name)
-        except (ConfigError, OSError) as e:
-            ui.notify(str(e), type="negative")
-            return
-        self.dialog.edit_build(None)
+        state, _ = self.builds.get(self.name)
+        # A registered collection still uses the files
+        delete_files = not state.registered
+        output = state.spec.output_path(self.dialog.workspace.folder)
+        with ui.dialog() as confirm, ui.card():
+            ui.label(f"Remove build {self.name!r}?")
+            ui.label(
+                f"Its files ({output}) are deleted."
+                if delete_files
+                else f"Its files are kept: collection {self.name!r} uses them "
+                "(removing the collection deletes them)."
+            ).classes("text-sm text-grey-8 break-all")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=confirm.close).props("flat")
+
+                def do_remove():
+                    confirm.close()
+                    try:
+                        self.builds.remove(self.name, delete_files=delete_files)
+                    except (ConfigError, OSError) as e:
+                        ui.notify(str(e), type="negative")
+                        return
+                    self.dialog.edit_build(None)
+
+                ui.button("Remove", on_click=do_remove).props("color=negative").mark(
+                    "build-remove-confirm"
+                )
+        confirm.open()

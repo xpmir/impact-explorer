@@ -14,11 +14,14 @@ The build is a sequence of stages; a resumed build skips completed stages:
 - ``prepare``: downloads the datamaestro documents;
 - ``docstore``: copies them into an impact-index document store, which
   checkpoints regularly, so an interrupted copy resumes from its last
-  checkpoint;
+  checkpoint; skipped when datamaestro already stores the documents in an
+  impact-index document store (it is used as is);
 - ``index``: builds the BOW index from the (local) document store; an
   interrupted index restarts from scratch (impact-index does not
   checkpoint the vocabulary and document lengths of BOW indexes), but
-  never downloads or copies the documents again.
+  never downloads or copies the documents again;
+- ``compress`` (optional): compresses the BOW index (block-max bitpacked
+  postings, lossless), then deletes the uncompressed one.
 
 The interface registers the collection in the workspace once the build is
 complete (the runner never writes ``workspace.json``, which the interface
@@ -49,12 +52,15 @@ from .documents import Document
 logger = logging.getLogger(__name__)
 
 BUILDS_FOLDER = "builds"
-STAGES = ("prepare", "docstore", "index")
+STAGES = ("prepare", "docstore", "index", "compress")
 STAGE_LABELS = {
     "prepare": "Download documents",
     "docstore": "Document store",
     "index": "BOW index",
+    "compress": "Compression",
 }
+INDEX_STAGES = ("index", "compress")
+"""Stages run again when only the index is rebuilt"""
 PIPELINES = ("pyserini", "terrier", "terrier-pisa")
 STOP_WORDS = ("default", "lucene", "terrier", "none")
 """``default``: the pipeline's own list"""
@@ -67,6 +73,9 @@ BATCH_SIZE = 4096
 
 SAVE_INTERVAL = 2.0
 """Seconds between two progress updates of the state file"""
+
+LOG_RUN_MARKER = "--- "
+"""Starts the log lines of a run"""
 
 
 class Cancelled(Exception):
@@ -90,6 +99,9 @@ class BuildSpec:
     positions: bool = False
     """Stores token positions (for ``#1`` and ``#uwN`` queries)"""
 
+    compress: bool = False
+    """Compresses the index (and deletes the uncompressed one)"""
+
     datasets: list[str] = field(default_factory=list)
     """datamaestro IR datasets of the registered collection (topics and
     assessments)"""
@@ -109,6 +121,17 @@ class BuildSpec:
     def output_path(self, workspace: Path) -> Path:
         path = Path(self.output or f"indexes/{self.name}").expanduser()
         return path if path.is_absolute() else workspace / path
+
+    def stages(self) -> tuple[str, ...]:
+        return tuple(s for s in STAGES if s != "compress" or self.compress)
+
+    def options_text(self) -> str:
+        options = [self.pipeline, f"stop words {self.stop_words}"]
+        if self.positions:
+            options.append("positions")
+        if self.compress:
+            options.append("compressed")
+        return ", ".join(options)
 
     def builder_options(self) -> dict:
         stop_words = {"default": None, "none": []}.get(self.stop_words, self.stop_words)
@@ -159,15 +182,18 @@ class BuildState:
     registered: bool = False
     """The collection has been added to the workspace"""
 
+    datamaestro_store: str | None = None
+    """datamaestro's own document store, used instead of a copy"""
+
     created: float = field(default_factory=time.time)
     updated: float = field(default_factory=time.time)
 
     @property
     def complete(self) -> bool:
-        return all(s.status == "done" for s in self.stages.values())
+        return all(self.stages[s].status == "done" for s in self.spec.stages())
 
     def current_stage(self) -> str | None:
-        for name in STAGES:
+        for name in self.spec.stages():
             if self.stages[name].status != "done":
                 return name
         return None
@@ -182,7 +208,9 @@ class BuildState:
             return "failed"
         if self.cancelled:
             return "cancelled"
-        if any(s.status in ("running", "done") for s in self.stages.values()):
+        if any(
+            self.stages[s].status in ("running", "done") for s in self.spec.stages()
+        ):
             return "interrupted"
         return "pending"
 
@@ -229,11 +257,13 @@ class BuildFiles:
             return False
 
     def log_tail(self, lines: int = 30) -> str:
+        """The end of the log of the last run (earlier runs are not shown)"""
         if not self.log.exists():
             return ""
         with open(self.log, "rb") as fp:
             fp.seek(max(0, fp.seek(0, os.SEEK_END) - 16384))
             text = fp.read().decode("utf-8", errors="replace")
+        text = text[text.rfind(LOG_RUN_MARKER) :] if LOG_RUN_MARKER in text else text
         return "\n".join(text.splitlines()[-lines:])
 
 
@@ -301,7 +331,7 @@ class Runner:
         self.save()
         stage = None
         try:
-            for stage in STAGES:
+            for stage in self.spec.stages():
                 if self.state.stages[stage].status == "done":
                     logger.info("Stage %s already done", stage)
                     continue
@@ -339,6 +369,10 @@ class Runner:
 
     def stage_prepare(self, stage: StageState):
         documents = self.dataset()
+        self.state.datamaestro_store = None
+        if (store := datamaestro_store(documents)) is not None:
+            logger.info("Using datamaestro's document store %s", store)
+            self.state.datamaestro_store = str(store)
         try:
             # A property or a method, depending on the dataset type
             count = documents.documentcount
@@ -362,6 +396,10 @@ class Runner:
     def stage_docstore(self, stage: StageState):
         import impact_index
 
+        if self.state.datamaestro_store:
+            # Nothing to copy
+            stage.done = stage.total = len(self.store())
+            return
         folder = self.output / "docstore"
         if stage.resumed_from == 0 and stage.done == 0:
             # A first run: drop leftovers of a removed build
@@ -385,30 +423,101 @@ class Runner:
     def stage_index(self, stage: StageState):
         import impact_index
 
-        store = impact_index.DocumentStore.load(str(self.output / "docstore"), "mmap")
-        folder = self.output / "index"
+        store = self.store()
+        folder = self.bow_folder()
         # BOW indexes cannot resume: start again from the document store
         shutil.rmtree(folder, ignore_errors=True)
-        stage.total, stage.done, stage.resumed_from = store.num_documents(), 0, 0
+        stage.total, stage.done, stage.resumed_from = len(store), 0, 0
         stage.started = time.time()
         self.save()
         builder = impact_index.BOWIndexBuilder(
             str(folder), dtype="int32", **self.spec.builder_options()
         )
         for start in range(0, stage.total, BATCH_SIZE):
-            numbers = list(range(start, min(start + BATCH_SIZE, stage.total)))
-            documents = store.get_by_number(numbers)
-            builder.add_texts(
-                [
-                    (number, stored_text(doc.content))
-                    for number, doc in zip(numbers, documents, strict=True)
-                ]
-            )
-            stage.done = numbers[-1] + 1
+            texts = store.texts(start, min(start + BATCH_SIZE, stage.total))
+            builder.add_texts(list(enumerate(texts, start=start)))
+            stage.done = start + len(texts)
             self.save(force=False)
         logger.info("Writing the index")
         self.save()
         builder.build(in_memory=False)
+
+    def store(self) -> "LocalStore | DatamaestroStore":
+        """The documents to index (document number = index docid)"""
+        if self.state.datamaestro_store:
+            return DatamaestroStore(self.dataset())
+        return LocalStore(self.output / "docstore")
+
+    def bow_folder(self) -> Path:
+        """The (uncompressed) BOW index"""
+        return self.output / ("index.raw" if self.spec.compress else "index")
+
+    def stage_compress(self, stage: StageState):
+        import impact_index
+
+        raw, folder = self.bow_folder(), self.output / "index"
+        if not raw.exists() and folder.exists():
+            # Interrupted after the compressed index replaced the raw one
+            return
+        tmp = self.output / "index.tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        index = impact_index.Index.load(str(raw), False)
+        stage.total = stage.done = 0
+        self.save()
+        logger.info("Compressing the index")
+        index.compress(str(tmp), in_memory=False)
+        del index
+        shutil.rmtree(folder, ignore_errors=True)
+        tmp.rename(folder)
+        shutil.rmtree(raw)
+
+
+class LocalStore:
+    """The document store copied by the build"""
+
+    def __init__(self, folder: Path):
+        import impact_index
+
+        self.store = impact_index.DocumentStore.load(str(folder), "mmap")
+
+    def __len__(self):
+        return self.store.num_documents()
+
+    def texts(self, start: int, end: int) -> list[str]:
+        documents = self.store.get_by_number(list(range(start, end)))
+        return [stored_text(doc.content) for doc in documents]
+
+
+class DatamaestroStore:
+    """The impact-index document store of a datamaestro dataset"""
+
+    def __init__(self, documents):
+        self.documents = documents
+
+    def __len__(self):
+        return self.documents._store.num_documents()
+
+    def texts(self, start: int, end: int) -> list[str]:
+        from .documents import record_to_document
+
+        records = itertools.islice(
+            self.documents.iter_documents_from(start), end - start
+        )
+        return [indexed_text(record_to_document(record)) for record in records]
+
+
+def datamaestro_store(documents) -> Path | None:
+    """The folder of the impact-index document store holding datamaestro
+    documents, if any: its document numbers follow the iteration order,
+    and it can fetch documents by id (no need for a copy)"""
+    try:
+        from datamaestro_ir.data import CompressedDocumentStore
+    except ImportError:
+        return None
+    if not isinstance(documents, CompressedDocumentStore):
+        return None
+    path = Path(documents.path)
+    return path if path.is_dir() else None
 
 
 class DownloadError(RuntimeError):
@@ -448,6 +557,17 @@ def download(dataset_id: str):
         lines = [line for line in captured.getvalue().splitlines() if line.strip()]
         cause = f": {lines[-1].strip()}" if lines else " (see the log)"
         raise DownloadError(f"Could not download {dataset_id}{cause}")
+
+
+INDEX_FOLDERS = ("index", "index.raw", "index.tmp")
+
+
+def delete_output(output: Path):
+    """Deletes the output of a build"""
+    for sub in INDEX_FOLDERS + ("docstore",):
+        shutil.rmtree(output / sub, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        output.rmdir()
 
 
 def run_build(workspace: Path, name: str):
@@ -498,7 +618,7 @@ class Builds:
             raise ConfigError(f"Build {name!r} is already running")
         files.log.parent.mkdir(parents=True, exist_ok=True)
         with open(files.log, "a") as log:
-            log.write(f"--- {time.strftime('%Y-%m-%d %H:%M:%S')} start\n")
+            log.write(f"{LOG_RUN_MARKER}{time.strftime('%Y-%m-%d %H:%M:%S')} start\n")
             log.flush()
             subprocess.Popen(
                 [
@@ -521,24 +641,69 @@ class Builds:
         if alive and state.pid:
             os.kill(state.pid, signal.SIGTERM)
 
-    def reset(self, name: str):
-        """Forgets the progress and deletes the output (restart from scratch)"""
+    def reset(
+        self, name: str, spec: BuildSpec | None = None, keep_documents: bool = False
+    ):
+        """Forgets the progress and deletes the output (restart from scratch)
+
+        :param spec: new options (same name and documents)
+        :param keep_documents: keeps the document store (only the index is
+            built again)
+        """
         files = self.files(name)
         if files.alive():
             raise ConfigError(f"Build {name!r} is running")
         state = files.load()
+        if spec is not None:
+            if (spec.name, spec.documents) != (state.spec.name, state.spec.documents):
+                raise ConfigError("The name and documents of a build cannot change")
+            spec.validate()
+        else:
+            spec = state.spec
         output = state.spec.output_path(self.workspace.folder)
-        for sub in ("docstore", "index"):
+        kept = {}
+        if keep_documents and state.stages["docstore"].status == "done":
+            kept = {s: state.stages[s] for s in STAGES if s not in INDEX_STAGES}
+        subs = INDEX_FOLDERS + (() if kept else ("docstore",))
+        for sub in subs:
             shutil.rmtree(output / sub, ignore_errors=True)
-        files.save(BuildState(spec=state.spec, created=state.created))
+        new = BuildState(spec=spec, created=state.created)
+        new.stages.update(kept)
+        if kept:
+            new.datamaestro_store = state.datamaestro_store
+        files.save(new)
 
-    def remove(self, name: str):
-        """Forgets a build (its index and document store are kept)"""
+    def remove(self, name: str, delete_files: bool = False):
+        """Forgets a build, and deletes its output if ``delete_files``"""
         files = self.files(name)
         if files.alive():
             raise ConfigError(f"Build {name!r} is running")
+        if delete_files:
+            delete_output(files.load().spec.output_path(self.workspace.folder))
         for path in (files.state, files.lock, files.log):
             path.unlink(missing_ok=True)
+
+    def collection_files(self, name: str) -> list[Path]:
+        """Files of a collection (index, document store): existing folders"""
+        collection = self.workspace.collection(name)
+        folders = [collection.index_path]
+        if collection.docstore and collection.docstore_path is not None:
+            folders.append(collection.docstore_path)
+        return [f for f in folders if f.exists()]
+
+    def remove_collection(self, name: str, delete_files: bool):
+        """Removes a collection from the workspace, with its build, and
+        deletes its files if ``delete_files``"""
+        folders = self.collection_files(name) if delete_files else []
+        for build in self.names():
+            if build == name:
+                self.remove(build, delete_files=delete_files)
+        self.workspace.remove(name)
+        for folder in folders:
+            shutil.rmtree(folder, ignore_errors=True)
+            with contextlib.suppress(OSError):
+                # The output folder of a build, now empty
+                folder.parent.rmdir()
 
     def collection(self, state: BuildState) -> CollectionConfig:
         spec = state.spec
@@ -548,6 +713,14 @@ class Builds:
             output = output.resolve().relative_to(self.workspace.folder)
         except ValueError:
             pass
+        if state.datamaestro_store:
+            # Documents fetched through datamaestro
+            return CollectionConfig(
+                name=spec.name,
+                index=str(output / "index"),
+                documents=spec.documents,
+                datasets=list(spec.datasets),
+            )
         return CollectionConfig(
             name=spec.name,
             index=str(output / "index"),

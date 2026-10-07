@@ -126,9 +126,16 @@ with `/?collection=<name>`.
 ### Index builds
 
 An index can also be built from the interface (settings, "Index builds"):
-give a name, a datamaestro documents dataset, the text pipeline and the
-topic datasets; when the build completes, the collection is added to the
-workspace under that name.
+give a name, a datamaestro documents dataset and the topic datasets, and
+choose the index options:
+
+- *pipeline* (`pyserini`, `terrier`, `terrier-pisa`) and *stop words*;
+- *positions*, needed for phrase (`#1`) and window (`#uwN`) queries;
+- *compression*: bitpacked block-max postings (lossless, faster search);
+  the uncompressed index is deleted once compressed.
+
+When the build completes, the collection is added to the workspace under
+that name.
 
 The documents and topic datasets are drop-downs (type to filter) listing
 the installed datamaestro repositories, read from the dataset definitions
@@ -140,19 +147,27 @@ collection of its own. Any other dataset id can still be typed.
 
 A build runs in its own process (`impact-explorer build <workspace>
 <name>`): it goes on if the interface stops, and the interface shows its
-progress again when restarted. It has three stages, and resuming a failed,
-cancelled or interrupted build skips the completed ones:
+progress again when restarted. Resuming a failed, cancelled or interrupted
+build skips the completed stages:
 
 1. *Download documents* (datamaestro);
 2. *Document store*: checkpointed every 50,000 documents, so an
-   interrupted copy resumes from its last checkpoint;
-3. *BOW index*, built from the local document store: an interrupted index
+   interrupted copy resumes from its last checkpoint. Skipped when
+   datamaestro already stores the documents in an impact-index document
+   store (e.g. BEIR): that store is used as is, and the collection reads
+   its documents through datamaestro;
+3. *BOW index*, built from the document store: an interrupted index
    restarts from the beginning of this stage (impact-index does not
    checkpoint the vocabulary of BOW indexes), but nothing is downloaded or
-   copied again.
+   copied again;
+4. *Compression* (optional).
 
-"Restart from scratch" deletes the document store and index and starts
-over; "Remove" forgets the build but keeps its files.
+"Rebuild…" builds again, possibly with other index options; by default
+only the index is rebuilt (the documents are not copied again). "Remove"
+forgets the build and deletes its files, unless its collection is in the
+workspace. Removing a collection deletes its index and document store
+(proposed by default for files inside the workspace, unchecked for
+indexes elsewhere); datamaestro's own files are never deleted.
 
 ### Collections
 

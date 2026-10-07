@@ -496,6 +496,8 @@ async def test_index_build(user: User, workspace, monkeypatch):
     assert datasets.value == ["fake.test"]
     assert datasets.options == ["fake.test", "other.topics"]
     assert user.find(marker="build-name").elements.pop().value == "built"
+    choose(user, "build-positions", True)
+    choose(user, "build-compress", True)
     user.find(marker="build-start").click()
     await user.should_see(marker="build-error")
     await user.should_see("OSError: network down")
@@ -509,6 +511,10 @@ async def test_index_build(user: User, workspace, monkeypatch):
     await user.should_see(marker="build-open")
     collection = workspace.collection("built")
     assert collection.index == "indexes/built/index"
+    output = workspace.folder / "indexes/built"
+    assert sorted(p.name for p in output.iterdir()) == ["docstore", "index"]
+    assert index_kind(output / "index") == "compressed"
+    assert services.builds.get("built")[0].spec.positions
 
     assert collection.datasets == ["fake.test"]
 
@@ -520,3 +526,56 @@ async def test_index_build(user: User, workspace, monkeypatch):
     user.find(marker="build-name").clear().type("built")
     user.find(marker="build-start").click()
     await user.should_see("already exists", marker="build-status")
+
+
+def index_kind(folder):
+    import json
+
+    return json.loads((folder / "manifest.json").read_text())["index_kind"]
+
+
+async def test_rebuild_and_remove(user: User, workspace, monkeypatch):
+    from impact_explorer import builds
+    from impact_explorer.builds import BuildSpec, Runner
+
+    from .test_builds import FakeDocuments
+
+    documents = FakeDocuments()
+    monkeypatch.setattr(Runner, "dataset", lambda runner: documents)
+    monkeypatch.setattr(builds.logger, "disabled", True)
+    monkeypatch.setattr(
+        builds.Builds,
+        "start",
+        lambda self, name: Runner(self.workspace.folder, name).run(),
+    )
+    services = services_for(workspace)
+    services.catalog = fake_catalog
+    services.builds.create(BuildSpec(name="built", documents="fake.documents"))
+    assert services.builds.register_completed() == ["built"]
+    output = workspace.folder / "indexes/built"
+    assert index_kind(output / "index") != "compressed"
+
+    create_app(services)
+    await user.open("/")
+    user.find(marker="settings").click()
+    user.find(marker="settings-build-built").click()
+    await user.should_see("done", marker="build-state")
+    # Rebuilds the index only, compressed
+    user.find(marker="build-reset").click()
+    choose(user, "build-compress", True)
+    user.find(marker="build-rebuild").click()
+    await user.should_see("compressed", marker="build-state-summary")
+    await user.should_see("done", marker="build-state")
+    assert documents.starts == [0]
+    assert index_kind(output / "index") == "compressed"
+    assert services.builds.register_completed() == ["built"]
+
+    # Removing the collection deletes its files and its build
+    user.find(marker="settings-collection-built").click()
+    user.find(marker="collection-remove").click()
+    await user.should_see(marker="collection-delete-files")
+    assert user.find(marker="collection-delete-files").elements.pop().value
+    user.find(marker="collection-remove-confirm").click()
+    assert "built" not in workspace.collections
+    assert not output.exists()
+    assert services.builds.names() == []

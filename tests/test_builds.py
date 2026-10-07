@@ -1,4 +1,5 @@
 import fcntl
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -256,3 +257,198 @@ def test_download_errors(monkeypatch):
     monkeypatch.setattr(type(context), "dataset", unknown)
     with pytest.raises(DownloadError, match="Unknown datamaestro dataset"):
         download("no.such.dataset")
+
+
+def index_kind(folder):
+    import json
+
+    return json.loads((folder / "manifest.json").read_text())["index_kind"]
+
+
+def test_compress(builds, fake):
+    files = create(builds, positions=True, compress=True)
+    run(builds)
+    state = files.load()
+    assert state.complete and state.stages["compress"].status == "done"
+    output = builds.workspace.folder / "indexes/fake"
+    # The uncompressed index is gone
+    assert sorted(p.name for p in output.iterdir()) == ["docstore", "index"]
+    assert index_kind(output / "index") == "compressed"
+    builds.register_completed()
+
+    from impact_explorer.engine import SearchEngine
+
+    engine = SearchEngine.open(builds.workspace.collection("fake"))
+    assert engine.has_positions
+    assert {hit.docid for hit in engine.search("quick fox").hits} == {"d0", "d2"}
+
+
+def test_compress_failure_keeps_the_index(builds, fake, monkeypatch):
+    files = create(builds, compress=True)
+
+    def fail(self, stage):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(Runner, "stage_compress", fail)
+    with pytest.raises(RuntimeError):
+        run(builds)
+    assert files.load().stages["index"].status == "done"
+    monkeypatch.undo()
+    monkeypatch.setattr(Runner, "dataset", lambda runner: fake.documents)
+    run(builds)
+    assert files.load().complete
+    # Only compressed again
+    assert fake.documents.starts == [0]
+
+
+def test_stages_without_compression():
+    spec = BuildSpec(name="x", documents="d")
+    assert spec.stages() == ("prepare", "docstore", "index")
+    state = BuildState(spec=spec)
+    for stage in spec.stages():
+        state.stages[stage].status = "done"
+    assert state.complete
+    # States saved before the compression stage existed
+    data = state.to_dict()
+    del data["stages"]["compress"], data["spec"]["compress"]
+    assert BuildState.from_dict(data).complete
+
+
+def test_rebuild_index_only(builds, fake):
+    files = create(builds)
+    run(builds)
+    spec = files.load().spec
+    spec.compress, spec.pipeline = True, "terrier"
+    builds.reset("fake", spec, keep_documents=True)
+    state = files.load()
+    assert state.stages["docstore"].status == "done"
+    assert state.stages["index"].status == "pending"
+    run(builds)
+    assert files.load().complete and files.load().spec.pipeline == "terrier"
+    # The documents were not copied again
+    assert fake.documents.starts == [0]
+    assert index_kind(builds.workspace.folder / "indexes/fake/index") == "compressed"
+
+    other = BuildSpec(name="fake", documents="other")
+    with pytest.raises(ConfigError, match="cannot change"):
+        builds.reset("fake", other)
+
+
+def test_remove(builds, fake):
+    output = builds.workspace.folder / "indexes/fake"
+    create(builds)
+    run(builds)
+    builds.register_completed()
+    # Kept without deletion
+    builds.remove_collection("fake", delete_files=False)
+    assert output.exists() and builds.names() == []
+
+    create(builds)
+    run(builds)
+    builds.remove("fake", delete_files=True)
+    assert not output.exists()
+
+    create(builds)
+    run(builds)
+    builds.register_completed()
+    assert builds.collection_files("fake") == [output / "index", output / "docstore"]
+    builds.remove_collection("fake", delete_files=True)
+    assert not output.exists() and "fake" not in builds.workspace.collections
+
+
+def test_log_tail(builds):
+    files = builds.files("x")
+    files.log.parent.mkdir(parents=True)
+    files.log.write_text("--- 1 start\nold failure\n--- 2 start\nworking\n")
+    assert files.log_tail() == "--- 2 start\nworking"
+
+
+def test_option_labels():
+    from impact_explorer.builds import PIPELINES, STOP_WORDS
+    from impact_explorer.settings_ui import PIPELINE_LABELS, STOP_WORDS_LABELS
+
+    assert tuple(PIPELINE_LABELS) == PIPELINES
+    assert tuple(STOP_WORDS_LABELS) == STOP_WORDS
+
+
+class FakeStoreDocuments:
+    """datamaestro documents in an impact-index document store"""
+
+    def __init__(self, path):
+        import impact_index
+
+        builder = impact_index.DocumentStoreBuilder(str(path))
+        for document in DOCUMENTS:
+            builder.add({"id": document.docid}, document.text.encode())
+        builder.build()
+        self.path = path
+        self._store = impact_index.DocumentStore.load(str(path), "mmap")
+
+    def iter_documents_from(self, start=0):
+        for document in DOCUMENTS[start:]:
+            yield {
+                "id": document.docid,
+                "text_item": SimpleNamespace(text=document.text),
+            }
+
+    def docid_internal2external(self, docid):
+        return DOCUMENTS[docid].docid
+
+    def document_ext(self, docid):
+        document = next(d for d in DOCUMENTS if d.docid == docid)
+        return {"id": docid, "text_item": SimpleNamespace(text=document.text)}
+
+    def documents_ext(self, docids):
+        return [self.document_ext(docid) for docid in docids]
+
+
+def test_datamaestro_store(builds, tmp_path, monkeypatch):
+    """datamaestro's own document store is used, not copied"""
+    documents = FakeStoreDocuments(tmp_path / "dm-store")
+    monkeypatch.setattr(Runner, "dataset", lambda runner: documents)
+    monkeypatch.setattr(
+        builds_module, "datamaestro_store", lambda d: getattr(d, "path", None)
+    )
+    files = create(builds, compress=True)
+    run(builds)
+    state = files.load()
+    assert state.complete
+    assert state.datamaestro_store == str(tmp_path / "dm-store")
+    assert state.stages["docstore"].done == len(DOCUMENTS)
+    output = builds.workspace.folder / "indexes/fake"
+    assert sorted(p.name for p in output.iterdir()) == ["index"]
+
+    collection = builds.collection(state)
+    assert (collection.documents, collection.docstore) == ("fake.documents", None)
+
+    from impact_explorer.documents import DatamaestroDocumentSource
+    from impact_explorer.engine import SearchEngine
+
+    collection.base = builds.workspace.folder
+    engine = SearchEngine(collection, DatamaestroDocumentSource(documents))
+    assert {hit.docid for hit in engine.search("quick fox").hits} == {"d0", "d2"}
+
+    # Rebuilding the index only keeps using it
+    builds.reset("fake", keep_documents=True)
+    assert files.load().datamaestro_store == state.datamaestro_store
+    run(builds)
+    assert files.load().complete
+    # Removing the collection never deletes datamaestro's files
+    builds.register_completed()
+    builds.remove_collection("fake", delete_files=True)
+    assert (tmp_path / "dm-store").is_dir() and not output.exists()
+
+
+def test_datamaestro_store_detection():
+    from impact_explorer.builds import datamaestro_store
+
+    assert datamaestro_store(FakeDocuments()) is None
+    try:
+        from datamaestro import prepare_dataset
+
+        documents = prepare_dataset("co.huggingface.nano-beir.nfcorpus.documents")
+    except Exception:
+        pytest.skip("nano-beir datasets not available")
+    if not Path(documents.path).is_dir():
+        pytest.skip("nano-beir NFCorpus not downloaded")
+    assert datamaestro_store(documents) == Path(documents.path)
